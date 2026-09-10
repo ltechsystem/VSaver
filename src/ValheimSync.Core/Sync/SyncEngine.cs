@@ -12,9 +12,14 @@ namespace ValheimSync.Core.Sync;
 ///   * FileSystemWatcher (debounced) → upload after Valheim finishes a save
 ///   * Periodic poll (default 15 min) → download remote changes / fallback upload check
 ///   * MD5 comparison against Drive's md5Checksum → no duplicate transfers, ever
-///   * .fwl is uploaded last and acts as the "commit marker" for the pair
+///   * A world's "manifest.commit" marker is uploaded LAST and certifies that the whole
+///     file set currently under its "&lt;world&gt;/" prefix was uploaded together
+///     (see CommitMarker)
 ///   * Downloads go to a temp file, are hash-verified, then moved atomically
 ///   * Nothing is downloaded while Valheim is running
+///
+/// Only the modern chunked-folder save format (see <see cref="WorldSave"/>) is
+/// supported — Valheim's old flat ".db"/".fwl" pair is not recognized.
 /// </summary>
 public sealed class SyncEngine : IAsyncDisposable
 {
@@ -124,8 +129,9 @@ public sealed class SyncEngine : IAsyncDisposable
             .FirstOrDefault(w => string.Equals(w.Name, worldName, StringComparison.OrdinalIgnoreCase));
 
         var remote = await _cloud.ListFilesAsync(ct);
-        var remoteDb = remote.FirstOrDefault(f => f.Name.Equals($"{worldName}.db", StringComparison.OrdinalIgnoreCase));
-        var remoteFwl = remote.FirstOrDefault(f => f.Name.Equals($"{worldName}.fwl", StringComparison.OrdinalIgnoreCase));
+        var remoteFiles = RemoteWorldFiles(remote, worldName);
+        var remoteManifest = remote.FirstOrDefault(f =>
+            f.Name.Equals(CommitMarker.Name(worldName), StringComparison.OrdinalIgnoreCase));
 
         var whoHasLock = await _cloud.GetLockAsync(worldName, ct);
         bool iHoldLock = whoHasLock is not null &&
@@ -133,16 +139,16 @@ public sealed class SyncEngine : IAsyncDisposable
         bool otherHoldsLock = whoHasLock is not null && !whoHasLock.IsStale && !iHoldLock;
 
         // ---- Case 1: nothing local, remote exists → first-time download ----
-        if (local is null && remoteDb is not null && remoteFwl is not null)
+        if (local is null && remoteFiles.Count > 0)
         {
-            if (CommitState(remote, worldName, remoteDb, remoteFwl) == false)
+            if (!CommitState(remoteFiles, remoteManifest))
             {
                 Info($"[{worldName}] Remote save looks torn (an upload was interrupted) — " +
                      "waiting for the next complete upload before downloading.");
                 WorldStatusChanged?.Invoke(worldName, SyncStatus.Error);
                 return;
             }
-            await DownloadWorldAsync(worldName, ct);
+            await DownloadWorldAsync(worldName, remoteFiles, ct);
             return;
         }
 
@@ -152,22 +158,20 @@ public sealed class SyncEngine : IAsyncDisposable
             return;
         }
 
-        // ---- Compare hashes ----
-        var localDbHash = await Hashing.Md5Async(local.DbPath, ct);
-        bool dbMatches = remoteDb?.Md5Checksum == localDbHash;
+        // ---- Compare: does the local file set exactly match what's remote? ----
+        var localHashes = await HashLocalManifestAsync(worldName, local, ct);
+        bool setMatches = FileSetMatches(localHashes, remoteFiles);
 
-        if (dbMatches)
+        if (setMatches)
         {
-            // A matching .db is also our chance to repair a torn or unannotated remote
-            // (missing .fwl, or a missing/stale commit marker) — but never over someone
-            // else's active session.
+            // A matching set has nothing partial left to complete — the only repairable
+            // defect is a missing/stale manifest marker.
             if (!otherHoldsLock)
             {
-                try { await RepairRemotePairAsync(local, localDbHash, remote, remoteDb!, remoteFwl, ct); }
-                catch (Exception ex) { Info($"[{worldName}] Couldn't repair remote pair: {ex.Message}"); }
+                try { await RepairRemoteManifestAsync(worldName, localHashes, remoteFiles, remoteManifest, ct); }
+                catch (Exception ex) { Info($"[{worldName}] Couldn't repair remote manifest: {ex.Message}"); }
             }
-            WorldStatusChanged?.Invoke(worldName,
-                otherHoldsLock ? SyncStatus.LockedByOther : SyncStatus.InSync);
+            WorldStatusChanged?.Invoke(worldName, otherHoldsLock ? SyncStatus.LockedByOther : SyncStatus.InSync);
             return;
         }
 
@@ -175,10 +179,10 @@ public sealed class SyncEngine : IAsyncDisposable
         // If I hold the lock (or no one does and my file is newer), upload.
         // If someone else holds the lock, or the remote is newer, download —
         // but never while Valheim is running locally.
-        bool remoteIsNewer = remoteDb is not null &&
-            remoteDb.ModifiedTime.UtcDateTime > local.LastWriteUtc;
+        bool remoteIsNewer = remoteFiles.Count > 0 &&
+            remoteFiles.Max(f => f.ModifiedTime.UtcDateTime) > local.LastWriteUtc;
 
-        if (iHoldLock || (remoteDb is null) || (!otherHoldsLock && !remoteIsNewer))
+        if (iHoldLock || remoteFiles.Count == 0 || (!otherHoldsLock && !remoteIsNewer))
         {
             if (ValheimProcess.IsRunning())
             {
@@ -193,7 +197,7 @@ public sealed class SyncEngine : IAsyncDisposable
                 }
                 Info($"[{worldName}] Valheim running — pushing in-progress save.");
             }
-            await UploadWorldAsync(local, localDbHash, ct);
+            await UploadWorldAsync(worldName, local, localHashes, remote, ct);
         }
         else
         {
@@ -203,47 +207,67 @@ public sealed class SyncEngine : IAsyncDisposable
                 WorldStatusChanged?.Invoke(worldName, SyncStatus.RemoteNewer);
                 return;
             }
-            // remoteDb is non-null on this branch; the pair must be complete and untorn.
-            if (remoteFwl is null || CommitState(remote, worldName, remoteDb!, remoteFwl) == false)
+            if (!CommitState(remoteFiles, remoteManifest))
             {
                 Info($"[{worldName}] Remote save is incomplete or torn — skipping download " +
                      "until it's re-uploaded.");
                 WorldStatusChanged?.Invoke(worldName, SyncStatus.Error);
                 return;
             }
-            await DownloadWorldAsync(worldName, ct);
+            await DownloadWorldAsync(worldName, remoteFiles, ct);
         }
     }
 
-    private async Task UploadWorldAsync(WorldSave world, string dbMd5, CancellationToken ct)
+    private async Task UploadWorldAsync(string worldName, WorldSave local,
+        IReadOnlyDictionary<string, string> localHashes, IReadOnlyList<RemoteFile> remote, CancellationToken ct)
     {
-        WorldStatusChanged?.Invoke(world.Name, SyncStatus.Syncing);
+        WorldStatusChanged?.Invoke(worldName, SyncStatus.Syncing);
 
         // Snapshot once per play session: the first upload of a session rolls the
-        // pre-session remote save into a single backup per world (<world>.db.bak /
-        // <world>.fwl.bak). Later uploads in the same session — in-game auto-saves and
-        // the final save on exit — leave that backup untouched, so it always holds the
-        // state from before the session began. The set is persisted so an app restart
-        // mid-session can't retrigger it.
-        if (_session.BackedUpWorlds.Add(world.Name))
+        // pre-session remote save into a single backup per world. Later uploads in the
+        // same session — in-game auto-saves and the final save on exit — leave that
+        // backup untouched, so it always holds the state from before the session began.
+        // The set is persisted so an app restart mid-session can't retrigger it.
+        if (_session.BackedUpWorlds.Add(worldName))
         {
-            await BackupRemoteAsync(world, ct);
+            await BackupRemoteAsync(worldName, remote, ct);
             _session.Save(_sessionStatePath);
         }
 
-        Info($"[{world.Name}] Uploading ({world.SizeBytes / (1024.0 * 1024):F1} MB)...");
+        Info($"[{worldName}] Uploading ({local.SizeBytes / (1024.0 * 1024):F1} MB)...");
 
-        // Upload order is the crash-safety story: .db, then .fwl, then the commit marker
-        // LAST. Only a marker whose content matches the pair's MD5s certifies the pair as
-        // uploaded-together, so an interrupt anywhere before the marker leaves the remote
-        // detectably torn instead of silently downloadable.
-        await _cloud.UploadAsync(world.DbPath, world.DbFileName, null, ct);
-        await _cloud.UploadAsync(world.FwlPath, world.FwlFileName, null, ct);
-        var fwlMd5 = await Hashing.Md5Async(world.FwlPath, ct);
-        await UploadCommitMarkerAsync(world.Name, dbMd5, fwlMd5, ct);
+        // Skip any file whose remote copy already matches by MD5 — untouched chunk files
+        // (the common case: most zones don't change between saves) cost nothing here.
+        var remoteByName = remote.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
+        foreach (var path in local.AllFilePaths)
+        {
+            var remoteName = RemoteName(worldName, path);
+            if (remoteByName.TryGetValue(remoteName, out var existing) &&
+                string.Equals(existing.Md5Checksum, localHashes[remoteName], StringComparison.OrdinalIgnoreCase))
+                continue;
+            await _cloud.UploadAsync(path, remoteName, null, ct);
+        }
 
-        Info($"[{world.Name}] Upload complete.");
-        WorldStatusChanged?.Invoke(world.Name, SyncStatus.InSync);
+        // Drop any remote file under this world's prefix that isn't part of the current
+        // revision any more (a superseded chunk, or the previous revision's main files) —
+        // otherwise a stale leftover could be mistaken for part of a future revision.
+        var currentNames = localHashes.Keys;
+        var prefix = CommitMarker.RemotePrefix(worldName);
+        var markerName = CommitMarker.Name(worldName);
+        foreach (var f in remote.Where(f =>
+                     f.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                     !f.Name.Equals(markerName, StringComparison.OrdinalIgnoreCase) &&
+                     !currentNames.Contains(f.Name)))
+            await _cloud.DeleteAsync(f.Name, ct);
+
+        // The manifest marker is uploaded LAST. Only a marker whose content matches every
+        // file's MD5 certifies the set as uploaded together, so an interrupt anywhere
+        // before the marker leaves the remote detectably torn instead of silently
+        // downloadable.
+        await UploadCommitMarkerAsync(worldName, localHashes, ct);
+
+        Info($"[{worldName}] Upload complete.");
+        WorldStatusChanged?.Invoke(worldName, SyncStatus.InSync);
     }
 
     /// <summary>
@@ -263,165 +287,174 @@ public sealed class SyncEngine : IAsyncDisposable
     }
 
     /// <summary>
-    /// Copies the world's current remote .db/.fwl into a single rolling backup
-    /// (<c>.db.bak</c>/<c>.fwl.bak</c>) before they are overwritten. Best-effort: a
-    /// failed backup is logged but never blocks the upload that follows.
+    /// Server-side-copies the world's whole current "&lt;world&gt;/" prefix to a
+    /// "&lt;world&gt;.bak/" prefix before it's overwritten, then removes any leftover
+    /// .bak file that isn't part of this backup (a previous revision may have had a
+    /// different set of chunk files). Best-effort: a failed backup is logged but never
+    /// blocks the upload that follows.
     /// </summary>
-    private async Task BackupRemoteAsync(WorldSave world, CancellationToken ct)
+    private async Task BackupRemoteAsync(string worldName, IReadOnlyList<RemoteFile> remote, CancellationToken ct)
     {
         try
         {
-            var dbBacked = await _cloud.CopyAsync(world.DbFileName, world.DbFileName + ".bak", ct);
-            var fwlBacked = await _cloud.CopyAsync(world.FwlFileName, world.FwlFileName + ".bak", ct);
-            // Keep the marker with its pair so a manual restore of the .bak files can be
-            // checked for consistency too.
-            await _cloud.CopyAsync(CommitMarker.Name(world.Name), CommitMarker.Name(world.Name) + ".bak", ct);
-            if (dbBacked || fwlBacked)
-                Info($"[{world.Name}] Backed up previous remote save.");
+            var prefix = CommitMarker.RemotePrefix(worldName);
+            var backupPrefix = worldName + ".bak/";
+            var toBackup = remote.Where(f => f.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            var newBackupNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var any = false;
+            foreach (var f in toBackup)
+            {
+                var dest = backupPrefix + f.Name[prefix.Length..];
+                newBackupNames.Add(dest);
+                if (await _cloud.CopyAsync(f.Name, dest, ct)) any = true;
+            }
+
+            foreach (var f in remote.Where(f =>
+                         f.Name.StartsWith(backupPrefix, StringComparison.OrdinalIgnoreCase) &&
+                         !newBackupNames.Contains(f.Name)))
+                await _cloud.DeleteAsync(f.Name, ct);
+
+            if (any) Info($"[{worldName}] Backed up previous remote save.");
         }
         catch (Exception ex)
         {
-            Info($"[{world.Name}] Couldn't back up previous remote save: {ex.Message}");
+            Info($"[{worldName}] Couldn't back up previous remote save: {ex.Message}");
         }
     }
 
     /// <summary>
-    /// Consistency of the remote .db/.fwl pair against its commit marker, judged purely
-    /// from the folder listing — the marker's canonical content makes its MD5 predictable
-    /// from the pair's MD5s, so no download is needed.
-    /// true = marker certifies the pair; false = torn (an upload was interrupted);
-    /// null = no marker or hashes unavailable (legacy remote — trusted as before).
+    /// Consistency of a world's remote file set against its manifest marker, judged
+    /// purely from the folder listing — the marker's canonical content makes its MD5
+    /// predictable from every file's MD5, so no download is needed. There is no legacy/
+    /// pre-marker era for this format, so a file set with no marker (or a stale one) is
+    /// always torn.
     /// </summary>
-    private static bool? CommitState(IReadOnlyList<RemoteFile> remote, string worldName,
-        RemoteFile remoteDb, RemoteFile remoteFwl)
+    private static bool CommitState(IReadOnlyList<RemoteFile> remoteFiles, RemoteFile? manifest)
     {
-        var commit = remote.FirstOrDefault(f =>
-            f.Name.Equals(CommitMarker.Name(worldName), StringComparison.OrdinalIgnoreCase));
-        if (commit?.Md5Checksum is null || remoteDb.Md5Checksum is null || remoteFwl.Md5Checksum is null)
-            return null;
-        var expected = Hashing.Md5Text(CommitMarker.Content(remoteDb.Md5Checksum, remoteFwl.Md5Checksum));
-        return string.Equals(commit.Md5Checksum, expected, StringComparison.OrdinalIgnoreCase);
+        if (remoteFiles.Count == 0) return true;
+        if (manifest?.Md5Checksum is null) return false;
+        if (remoteFiles.Any(f => f.Md5Checksum is null)) return false;
+        var expected = Hashing.Md5Text(
+            CommitMarker.Content(remoteFiles.Select(f => (f.Name, f.Md5Checksum!))));
+        return string.Equals(manifest.Md5Checksum, expected, StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task UploadCommitMarkerAsync(string worldName, string dbMd5, string fwlMd5,
-        CancellationToken ct)
+    private async Task UploadCommitMarkerAsync(string worldName,
+        IReadOnlyDictionary<string, string> fileHashes, CancellationToken ct)
     {
-        var tmp = Path.Combine(Path.GetTempPath(), $"vs-{Guid.NewGuid():N}.commit");
-        await File.WriteAllTextAsync(tmp, CommitMarker.Content(dbMd5, fwlMd5), ct);
+        var tmp = Path.Combine(Path.GetTempPath(), $"vs-{Guid.NewGuid():N}.manifest");
+        var content = CommitMarker.Content(fileHashes.Select(kv => (kv.Key, kv.Value)));
+        await File.WriteAllTextAsync(tmp, content, ct);
         try { await _cloud.UploadAsync(tmp, CommitMarker.Name(worldName), null, ct); }
         finally { File.Delete(tmp); }
     }
 
     /// <summary>
-    /// Runs when local and remote .db already match: completes a torn remote (its .fwl
-    /// never made it up) from our identical local copy, and writes/refreshes the commit
-    /// marker when it's missing (legacy remote) or stale (a marker upload failed after
-    /// the pair went up). Safe for any client — it only describes or completes content
-    /// that already matches what it has locally.
+    /// Runs when the local and remote file sets already match exactly: writes/refreshes
+    /// the manifest marker when it's missing or stale (its own upload failed after the
+    /// rest of the set went up). Safe for any client — it only describes content that
+    /// already matches what it has locally.
     /// </summary>
-    private async Task RepairRemotePairAsync(WorldSave local, string localDbHash,
-        IReadOnlyList<RemoteFile> remote, RemoteFile remoteDb, RemoteFile? remoteFwl,
-        CancellationToken ct)
+    private async Task RepairRemoteManifestAsync(string worldName,
+        IReadOnlyDictionary<string, string> localHashes, IReadOnlyList<RemoteFile> remoteFiles,
+        RemoteFile? manifest, CancellationToken ct)
     {
-        if (remoteFwl is null)
-        {
-            Info($"[{local.Name}] Remote .fwl is missing — completing the pair from the local copy.");
-            await _cloud.UploadAsync(local.FwlPath, local.FwlFileName, null, ct);
-            var uploadedFwlMd5 = await Hashing.Md5Async(local.FwlPath, ct);
-            await UploadCommitMarkerAsync(local.Name, remoteDb.Md5Checksum ?? localDbHash, uploadedFwlMd5, ct);
-            return;
-        }
-
-        if (remoteDb.Md5Checksum is null || remoteFwl.Md5Checksum is null) return;
-        if (CommitState(remote, local.Name, remoteDb, remoteFwl) == true) return;
-
-        // Marker absent or doesn't describe the pair that's actually up there — rewrite it.
-        await UploadCommitMarkerAsync(local.Name, remoteDb.Md5Checksum, remoteFwl.Md5Checksum, ct);
-        Info($"[{local.Name}] Wrote commit marker for the remote save.");
+        if (CommitState(remoteFiles, manifest)) return;
+        await UploadCommitMarkerAsync(worldName, localHashes, ct);
+        Info($"[{worldName}] Wrote manifest marker for the remote save.");
     }
 
-    private async Task DownloadWorldAsync(string worldName, CancellationToken ct)
+    private async Task DownloadWorldAsync(string worldName, IReadOnlyList<RemoteFile> remoteFiles,
+        CancellationToken ct)
     {
         WorldStatusChanged?.Invoke(worldName, SyncStatus.Syncing);
         Info($"[{worldName}] Downloading...");
 
         Directory.CreateDirectory(_settings.WorldsPath);
+        var worldDir = Path.Combine(_settings.WorldsPath, worldName);
 
-        var tmpDb = Path.Combine(Path.GetTempPath(), $"{worldName}-{Guid.NewGuid():N}.db");
-        var tmpFwl = Path.Combine(Path.GetTempPath(), $"{worldName}-{Guid.NewGuid():N}.fwl");
+        var prefix = CommitMarker.RemotePrefix(worldName);
+        var tmpDir = Path.Combine(Path.GetTempPath(), $"{worldName}-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tmpDir);
         try
         {
-            await _cloud.DownloadAsync($"{worldName}.db", tmpDb, null, ct);
-            await _cloud.DownloadAsync($"{worldName}.fwl", tmpFwl, null, ct);
+            var downloaded = new List<(string RemoteName, string TmpPath)>();
+            foreach (var f in remoteFiles)
+            {
+                var tmpPath = Path.Combine(tmpDir, f.Name[prefix.Length..]);
+                await _cloud.DownloadAsync(f.Name, tmpPath, null, ct);
+                downloaded.Add((f.Name, tmpPath));
+            }
 
-            // Verify both halves against the remote hashes before touching the live folder.
-            var remote = await _cloud.ListFilesAsync(ct);
-            var remoteDb = remote.First(f => f.Name.Equals($"{worldName}.db", StringComparison.OrdinalIgnoreCase));
-            if (remoteDb.Md5Checksum is not null &&
-                remoteDb.Md5Checksum != await Hashing.Md5Async(tmpDb, ct))
-                throw new IOException("Downloaded .db failed hash verification — aborting.");
-            var remoteFwl = remote.First(f => f.Name.Equals($"{worldName}.fwl", StringComparison.OrdinalIgnoreCase));
-            if (remoteFwl.Md5Checksum is not null &&
-                remoteFwl.Md5Checksum != await Hashing.Md5Async(tmpFwl, ct))
-                throw new IOException("Downloaded .fwl failed hash verification — aborting.");
+            // Verify every file against the listing's hash before touching the live folder.
+            var byName = remoteFiles.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
+            foreach (var (remoteName, tmpPath) in downloaded)
+            {
+                var expected = byName[remoteName].Md5Checksum;
+                if (expected is not null && expected != await Hashing.Md5Async(tmpPath, ct))
+                    throw new IOException($"Downloaded '{remoteName}' failed hash verification — aborting.");
+            }
 
-            var dbDest = Path.Combine(_settings.WorldsPath, $"{worldName}.db");
-            var fwlDest = Path.Combine(_settings.WorldsPath, $"{worldName}.fwl");
+            // Swap the whole folder: keep one safety copy of what we're replacing, then
+            // replace it entirely with exactly the new revision's files. A full swap
+            // (rather than overwriting file-by-file) is what prunes the previous
+            // revision's main files and any now-superseded chunks — the same end state
+            // Valheim's own save leaves. Nothing touches the live folder until every
+            // download above has verified — a failed/corrupt download leaves it as-is.
+            if (Directory.Exists(worldDir) && Directory.EnumerateFileSystemEntries(worldDir).Any())
+            {
+                var backupDir = worldDir + ".synbak";
+                if (Directory.Exists(backupDir)) Directory.Delete(backupDir, recursive: true);
+                Directory.Move(worldDir, backupDir);
+            }
+            Directory.CreateDirectory(worldDir);
 
-            // Keep one local safety copy of what we are about to replace.
-            if (File.Exists(dbDest)) File.Copy(dbDest, dbDest + ".synbak", overwrite: true);
-            if (File.Exists(fwlDest)) File.Copy(fwlDest, fwlDest + ".synbak", overwrite: true);
-
-            File.Move(tmpDb, dbDest, overwrite: true);
-            File.Move(tmpFwl, fwlDest, overwrite: true);
+            foreach (var (remoteName, tmpPath) in downloaded)
+                File.Move(tmpPath, Path.Combine(worldDir, remoteName[prefix.Length..]), overwrite: true);
 
             // Also drop it into Valheim's LocalLow folder so it actually shows up in the
             // in-game world list (see MirrorToLocalLow). Never fatal to the download.
-            MirrorToLocalLow(worldName, dbDest, fwlDest);
+            MirrorToLocalLow(worldName, worldDir);
 
             Info($"[{worldName}] Download complete.");
             WorldStatusChanged?.Invoke(worldName, SyncStatus.InSync);
         }
         finally
         {
-            if (File.Exists(tmpDb)) File.Delete(tmpDb);
-            if (File.Exists(tmpFwl)) File.Delete(tmpFwl);
+            if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true);
         }
     }
 
     /// <summary>
-    /// Copies a freshly downloaded world into Valheim's LocalLow "local storage" folder.
+    /// Copies a freshly downloaded world (every file, flat — a world folder never has
+    /// subfolders of its own) into Valheim's LocalLow "local storage" folder, replacing
+    /// anything already there (with a safety copy kept, same as the main download).
     /// Valheim only adds a world to the in-game list once it imports it from there and
     /// registers it with Steam Cloud — a world written solely into the Steam userdata\…\
     /// remote folder never appears. This automates the manual "copy into LocalLow, then
     /// open Valheim" step. It is best-effort: any failure is logged, never thrown, so a
     /// download is still considered complete even if this copy can't happen.
     /// </summary>
-    private void MirrorToLocalLow(string worldName, string dbSrc, string fwlSrc)
+    private void MirrorToLocalLow(string worldName, string worldDir)
     {
         try
         {
-            var folder = ValheimSaveLocations.ResolveLocalLowWorldsFolder();
+            var folder = ResolveLocalLowMirrorFolder();
             if (folder is null) return;
 
-            // If the app already syncs straight out of the LocalLow folder, the files are
-            // already there — nothing to mirror.
-            if (string.Equals(
-                    Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar),
-                    Path.GetFullPath(_settings.WorldsPath).TrimEnd(Path.DirectorySeparatorChar),
-                    StringComparison.OrdinalIgnoreCase))
-                return;
+            var dest = Path.Combine(folder, worldName);
 
-            Directory.CreateDirectory(folder);
-            var dbDest = Path.Combine(folder, $"{worldName}.db");
-            var fwlDest = Path.Combine(folder, $"{worldName}.fwl");
+            if (Directory.Exists(dest))
+            {
+                var backupDir = dest + ".synbak";
+                if (Directory.Exists(backupDir)) Directory.Delete(backupDir, recursive: true);
+                Directory.Move(dest, backupDir);
+            }
 
-            // Keep one safety copy of anything we replace, same as the main download does.
-            if (File.Exists(dbDest)) File.Copy(dbDest, dbDest + ".synbak", overwrite: true);
-            if (File.Exists(fwlDest)) File.Copy(fwlDest, fwlDest + ".synbak", overwrite: true);
-
-            File.Copy(dbSrc, dbDest, overwrite: true);
-            File.Copy(fwlSrc, fwlDest, overwrite: true);
+            Directory.CreateDirectory(dest);
+            foreach (var file in Directory.EnumerateFiles(worldDir))
+                File.Copy(file, Path.Combine(dest, Path.GetFileName(file)), overwrite: true);
 
             Info($"[{worldName}] Copied into Valheim's local folder — it will appear in game.");
         }
@@ -429,6 +462,57 @@ public sealed class SyncEngine : IAsyncDisposable
         {
             Info($"[{worldName}] Couldn't copy into Valheim's local folder: {ex.Message}");
         }
+    }
+
+    /// <summary>Resolves Valheim's LocalLow worlds folder to mirror a download into, or
+    /// null if it can't be found, or if it's the same folder we already sync out of (the
+    /// files are already there — nothing to mirror).</summary>
+    private string? ResolveLocalLowMirrorFolder()
+    {
+        var folder = ValheimSaveLocations.ResolveLocalLowWorldsFolder();
+        if (folder is null) return null;
+
+        if (string.Equals(
+                Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar),
+                Path.GetFullPath(_settings.WorldsPath).TrimEnd(Path.DirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        Directory.CreateDirectory(folder);
+        return folder;
+    }
+
+    private static List<RemoteFile> RemoteWorldFiles(IReadOnlyList<RemoteFile> remote, string worldName)
+    {
+        var prefix = CommitMarker.RemotePrefix(worldName);
+        var markerName = CommitMarker.Name(worldName);
+        return remote.Where(f => f.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                                  !f.Name.Equals(markerName, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+    }
+
+    private static async Task<Dictionary<string, string>> HashLocalManifestAsync(
+        string worldName, WorldSave local, CancellationToken ct)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in local.AllFilePaths)
+            result[RemoteName(worldName, path)] = await Hashing.Md5Async(path, ct);
+        return result;
+    }
+
+    private static string RemoteName(string worldName, string localPath) =>
+        CommitMarker.RemotePrefix(worldName) + Path.GetFileName(localPath);
+
+    private static bool FileSetMatches(IReadOnlyDictionary<string, string> localHashes,
+        IReadOnlyList<RemoteFile> remoteFiles)
+    {
+        if (remoteFiles.Count != localHashes.Count) return false;
+        foreach (var f in remoteFiles)
+        {
+            if (!localHashes.TryGetValue(f.Name, out var md5)) return false;
+            if (!string.Equals(f.Md5Checksum, md5, StringComparison.OrdinalIgnoreCase)) return false;
+        }
+        return true;
     }
 
     private void Info(string message)

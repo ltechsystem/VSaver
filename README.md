@@ -4,6 +4,8 @@ Keep one Valheim world in sync between a group of friends via a shared Google Dr
 
 **Stack:** .NET 8, Avalonia 11 (Fluent, MVVM via CommunityToolkit), Google Drive v3 API.
 
+> **Requires Valheim's current save format.** Worlds saved in the old, flat `<World>.db` + `<World>.fwl` layout aren't recognized — open the world in an up-to-date Valheim once (it upgrades the on-disk save to the new per-world folder layout automatically) before adding it as a server here. There's no compatibility fallback for the old format.
+
 ```
 ValheimSync/
 ├── src/
@@ -20,10 +22,10 @@ ValheimSync/
 
 ## How the sync works (30-second version)
 
-1. A `FileSystemWatcher` watches `worlds_local`. When Valheim writes a save, we wait until the files have been **quiet for 60 s** (debounce) before uploading — never a mid-write upload. Additionally, **while Valheim is open the current save is pushed every 5 minutes** (configurable via `InGameUploadMinutes`) as long as it actually changed and has settled — so a crash never loses more than that interval and friends can watch progress without waiting for you to quit.
-2. A **15-minute poll** (configurable) is the fallback and the download path: it compares your local `.db` MD5 against Drive's `md5Checksum`. Identical hash → nothing is transferred. **No duplicates, ever.**
-3. `.db` uploads first, `.fwl` last — the tiny `.fwl` is the "commit marker", so a half-finished upload never looks like a valid world.
-4. Downloads go to a temp file, are hash-verified, a `.synbak` copy of your old files is kept, and only then are the files moved into place. Never while Valheim is running.
+1. A `FileSystemWatcher` watches `worlds_local`, recursively (each world is its own subfolder). When Valheim writes a save, we wait until the files have been **quiet for 60 s** (debounce) before uploading — never a mid-write upload. Additionally, **while Valheim is open the current save is pushed every 5 minutes** (configurable via `InGameUploadMinutes`) as long as it actually changed and has settled — so a crash never loses more than that interval and friends can watch progress without waiting for you to quit.
+2. A **15-minute poll** (configurable) is the fallback and the download path: it compares every file's local MD5 against Drive's `md5Checksum`. Identical hash → nothing is transferred — including the terrain files Valheim didn't touch, since a world save is now many files (one per changed zone) rather than one giant file. **No duplicates, ever.**
+3. Every changed file uploads, then a tiny `manifest.commit` marker uploads last — it's the "commit marker" for the whole set, so a half-finished upload never looks like a valid world.
+4. Downloads go to a temp file, are hash-verified, a `.synbak` copy of your old world folder is kept, and only then is the new folder moved into place. Never while Valheim is running.
 5. **Locking:** before playing, click **Play** — the app writes `<World>.lock` (your name + timestamp) to the Drive folder. Everyone else's app sees the lock and shows the world as in use. Click **Done** when you stop: it pushes your final save and releases the lock. Locks older than 12 h are treated as stale (crashed client). Note: Drive has no atomic compare-and-swap, so two people clicking Play in the same second could theoretically race — fine for a friend group, and the app re-checks after writing to shrink the window.
 
 > ⚠️ Valheim worlds cannot be merged. The lock exists because if two people play "their" copy simultaneously, whoever uploads last silently destroys the other's progress. Respect the lock. If you want *simultaneous* multiplayer, run a dedicated server instead — this tool is for "pass the world around" play.
@@ -59,10 +61,10 @@ Drive file access uses **OAuth**, which means a `credentials.json` file instead 
 ### Things to know about "Testing" mode
 - Everyone will see an *"Google hasn't verified this app"* warning during the one-time sign-in. That's expected — click **Continue**. It's your own app; verification is only needed for public distribution.
 - Google may expire OAuth tokens after **7 days** in Testing mode, which means re-consenting weekly. To avoid that: on the OAuth consent screen page click **Publish app** (moves it to "In production"). You'll keep the unverified warning but tokens stop expiring. For a private friend group this is the pragmatic choice.
-- The app requests only the `drive.file` scope — it can *only* see files it created itself, not anyone's personal Drive contents. Good for trust and it keeps the consent screen tame.
+- The app requests the full `drive` scope, not the more restrictive `drive.file` — `drive.file` only sees files the app itself created, which would 404 on a folder someone else created for the group in the Drive web UI. Full scope means a wordier consent-screen warning, but it's what makes a pre-existing shared folder work at all. It still only ever touches the one folder you give it (see the "don't drag files in manually" note in Part 2, though — visibility isn't the same as the app recognizing what it sees).
 
 ### Is it OK to share credentials.json with friends?
-For a **Desktop app** OAuth client, Google itself documents that the "client secret" is not treated as a secret (it ships inside every installed app). Each friend still signs in with *their own* Google account and grants access only to files the app creates. So yes — bundling `credentials.json` with the app for your group is fine. Just don't commit it to a public GitHub repo (it's already in `.gitignore`).
+For a **Desktop app** OAuth client, Google itself documents that the "client secret" is not treated as a secret (it ships inside every installed app). Each friend still signs in with *their own* Google account, and their consent — not the shared `credentials.json` — is what actually grants access (see above for what that access covers: the full `drive` scope, not just app-created files). So yes — bundling `credentials.json` with the app for your group is fine. Just don't commit it to a public GitHub repo (it's already in `.gitignore`).
 
 ---
 
@@ -79,7 +81,7 @@ For a **Desktop app** OAuth client, Google itself documents that the "client sec
      pass it to the release script with `-DriveFolderId <id>` (see Part 3). Either way it's
      stored only in that user's local `settings.json`, never in the repo.
 
-> Heads up: because the app uses the restricted `drive.file` scope, the cleanest setup is that the *first* upload of each world happens through the app itself (the app then "owns" those files and everyone's app can see them via the shared folder). Don't manually drag save files into the folder through the Drive website.
+> Heads up: the *first* upload of each world has to happen through the app itself — don't manually drag save files into the folder through the Drive website. It's not a permissions issue (the app's full `drive` scope would see manually-added files fine); it's a naming one: a world's files are stored **flat**, all directly in the shared folder, with the world's name as a literal `<world>/` prefix in each filename (Drive allows `/` in a filename — it doesn't create a real subfolder). If you drag a folder into Drive through the website, Drive creates an actual nested folder there instead, and the app's listing (which only looks at files directly inside the shared folder) will never see what's in it.
 
 ---
 
@@ -194,5 +196,5 @@ Already built in: **auto-launch Valheim** on Play (with auto lock-release on exi
 
 - Windows-only paths for the Valheim save folder (Linux/macOS would need path variants).
 - Lock is advisory — the app enforces it in its own UI, but nothing stops someone from launching Valheim directly. Pairing Play with auto-launch (above) mitigates this socially.
-- `FindByNameAsync` lists the whole folder per lookup; fine for a handful of worlds, cache it if you sync many.
+- `FindByNameAsync` lists the whole shared folder per lookup, and every file upload/download/copy/delete does one — a world sync can mean a couple dozen files (main record + one per changed zone), so that's a couple dozen full-folder listings per sync. Fine for a friend group's handful of worlds; cache the listing per sync pass if this ever needs to scale up.
 - No conflict *merge* — Valheim saves can't be merged, so conflicts are prevented (lock), not resolved.

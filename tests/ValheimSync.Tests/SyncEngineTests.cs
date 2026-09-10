@@ -25,12 +25,10 @@ public sealed class SyncEngineTests : IDisposable
     private readonly SyncEngine _engine;
     private readonly List<SyncStatus> _statuses = new();
 
-    private string DbName => _world + ".db";
-    private string FwlName => _world + ".fwl";
-    private string CommitName => _world + ".commit";
-    private string LocalDb => Path.Combine(_dir, DbName);
-    private string LocalFwl => Path.Combine(_dir, FwlName);
+    private string WorldDir => Path.Combine(_dir, _world);
     private string SessionStatePath => Path.Combine(_dir, "sessionstate.json");
+    private string Prefix => _world + "/";
+    private string ManifestName => CommitMarker.Name(_world);
 
     public SyncEngineTests()
     {
@@ -43,30 +41,49 @@ public sealed class SyncEngineTests : IDisposable
 
     private static bool GameIsRunning => ValheimProcess.IsRunning();
 
-    private void WriteLocal(string dbContent, string fwlContent)
+    /// <summary>Writes a complete local revision: db2/fwl2/chunks-index/ok plus the given
+    /// chunk files (name -&gt; content).</summary>
+    private void WriteLocal(int revision, string db2 = "db2", string fwl2 = "fwl2",
+        IDictionary<string, string>? chunks = null)
     {
-        File.WriteAllText(LocalDb, dbContent);
-        File.WriteAllText(LocalFwl, fwlContent);
-    }
-
-    private static string CommitFor(string dbContent, string fwlContent) =>
-        CommitMarker.Content(Hashing.Md5Text(dbContent), Hashing.Md5Text(fwlContent));
-
-    /// <summary>Seeds a complete, internally consistent remote world (db + fwl + commit marker).</summary>
-    private void SeedRemoteWorld(string dbContent, string fwlContent,
-        DateTimeOffset? modified = null, bool withCommit = true)
-    {
-        _cloud.Seed(DbName, dbContent, modified);
-        _cloud.Seed(FwlName, fwlContent, modified);
-        if (withCommit) _cloud.Seed(CommitName, CommitFor(dbContent, fwlContent), modified);
+        Directory.CreateDirectory(WorldDir);
+        File.WriteAllText(Path.Combine(WorldDir, $"_main.{revision}.db2"), db2);
+        File.WriteAllText(Path.Combine(WorldDir, $"_main.{revision}.fwl2"), fwl2);
+        File.WriteAllText(Path.Combine(WorldDir, $"_main.{revision}.chunks"), "idx");
+        File.WriteAllText(Path.Combine(WorldDir, $"_main.{revision}.ok"), "1");
+        foreach (var (name, content) in chunks ?? new Dictionary<string, string>())
+            File.WriteAllText(Path.Combine(WorldDir, name), content);
     }
 
     private void AgeLocalFiles()
     {
         var old = new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-        File.SetLastWriteTimeUtc(LocalDb, old);
-        File.SetLastWriteTimeUtc(LocalFwl, old);
+        foreach (var f in Directory.EnumerateFiles(WorldDir))
+            File.SetLastWriteTimeUtc(f, old);
     }
+
+    /// <summary>Seeds a complete, internally consistent remote world.</summary>
+    private void SeedRemoteWorld(IReadOnlyDictionary<string, string> files,
+        DateTimeOffset? modified = null, bool withMarker = true)
+    {
+        foreach (var (name, content) in files)
+            _cloud.Seed(Prefix + name, content, modified);
+        if (withMarker)
+        {
+            var entries = files.Select(kv => (Prefix + kv.Key, Hashing.Md5Text(kv.Value)));
+            _cloud.Seed(ManifestName, CommitMarker.Content(entries), modified);
+        }
+    }
+
+    private static IReadOnlyDictionary<string, string> OneRevision(string db2 = "db2", string fwl2 = "fwl2") =>
+        new Dictionary<string, string>
+        {
+            ["_main.1.db2"] = db2,
+            ["_main.1.fwl2"] = fwl2,
+            ["_main.1.chunks"] = "idx",
+            ["_main.1.ok"] = "1",
+            ["1e_1e__1_1.chunk"] = "chunkA",
+        };
 
     // ---- download paths --------------------------------------------------
 
@@ -74,231 +91,323 @@ public sealed class SyncEngineTests : IDisposable
     public async Task FirstTimeDownload_WhenLocalMissingAndRemoteComplete()
     {
         if (GameIsRunning) return;
-        SeedRemoteWorld("dbcontent", "fwlcontent");
+        SeedRemoteWorld(OneRevision());
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("dbcontent", File.ReadAllText(LocalDb));
-        Assert.Equal("fwlcontent", File.ReadAllText(LocalFwl));
+        Assert.Equal("db2", File.ReadAllText(Path.Combine(WorldDir, "_main.1.db2")));
+        Assert.Equal("chunkA", File.ReadAllText(Path.Combine(WorldDir, "1e_1e__1_1.chunk")));
         Assert.Equal(SyncStatus.InSync, _statuses.Last());
     }
 
     [Fact]
-    public async Task LegacyRemote_WithoutCommitMarker_StillDownloads()
+    public async Task TornRemote_MissingMarker_IsNotDownloaded()
     {
         if (GameIsRunning) return;
-        // Remotes uploaded before the marker existed have no .commit — they're trusted.
-        SeedRemoteWorld("dbcontent", "fwlcontent", withCommit: false);
+        // There's no pre-marker era for this format — files with no marker at all are
+        // always an interrupted upload, never trusted.
+        SeedRemoteWorld(OneRevision(), withMarker: false);
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("dbcontent", File.ReadAllText(LocalDb));
-        Assert.Equal(SyncStatus.InSync, _statuses.Last());
+        Assert.False(Directory.Exists(WorldDir));
+        Assert.Equal(SyncStatus.Error, _statuses.Last());
+        Assert.DoesNotContain(_cloud.Calls, c => c.StartsWith("download:"));
     }
 
     [Fact]
     public async Task TornRemote_MarkerMismatch_IsNotDownloaded()
     {
         if (GameIsRunning) return;
-        // The marker certifies a v1 pair, but the .db in the folder is v2 — i.e. an upload
-        // died between the .db and the marker. Must not be treated as downloadable.
-        _cloud.Seed(DbName, "v2");
-        _cloud.Seed(FwlName, "old-fwl");
-        _cloud.Seed(CommitName, CommitFor("v1", "old-fwl"));
+        var files = OneRevision();
+        foreach (var (name, content) in files) _cloud.Seed(Prefix + name, content);
+        // Marker describes a db2 that doesn't match what's actually up there.
+        _cloud.Seed(ManifestName, CommitMarker.Content(new[]
+        {
+            (Prefix + "_main.1.db2", Hashing.Md5Text("some-other-content")),
+            (Prefix + "_main.1.fwl2", Hashing.Md5Text(files["_main.1.fwl2"])),
+            (Prefix + "_main.1.chunks", Hashing.Md5Text(files["_main.1.chunks"])),
+            (Prefix + "_main.1.ok", Hashing.Md5Text(files["_main.1.ok"])),
+            (Prefix + "1e_1e__1_1.chunk", Hashing.Md5Text(files["1e_1e__1_1.chunk"])),
+        }));
 
         await _engine.SyncNowAsync();
 
-        Assert.False(File.Exists(LocalDb));
+        Assert.False(Directory.Exists(WorldDir));
         Assert.Equal(SyncStatus.Error, _statuses.Last());
-        Assert.DoesNotContain(_cloud.Calls, c => c.StartsWith("download:"));
     }
 
     [Fact]
-    public async Task NoDownload_WhenRemoteFwlMissing()
+    public async Task PartialRemoteFiles_WithNoMarker_IsTreatedAsTorn()
     {
         if (GameIsRunning) return;
-        // Only the .db exists remotely — an interrupted first upload. The .fwl commit
-        // marker is absent, so this must NOT be treated as a downloadable world.
-        _cloud.Seed(DbName, "halfuploaded");
+        // Any file under this world's prefix makes it a download candidate — and with no
+        // marker at all, that's unambiguously an interrupted upload.
+        _cloud.Seed(Prefix + "_main.1.db2", "halfuploaded");
 
         await _engine.SyncNowAsync();
 
-        Assert.False(File.Exists(LocalDb));
-        Assert.Equal(SyncStatus.Unknown, _statuses.Last());
+        Assert.False(Directory.Exists(WorldDir));
+        Assert.Equal(SyncStatus.Error, _statuses.Last());
+        Assert.DoesNotContain(_cloud.Calls, c => c.StartsWith("download:"));
     }
 
     [Fact]
     public async Task Download_WhenOtherHoldsLock_AndKeepsSynbak()
     {
         if (GameIsRunning) return;
-        WriteLocal("localdb", "localfwl");
+        WriteLocal(1, db2: "localdb2", chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "localChunk" });
         AgeLocalFiles();
-        SeedRemoteWorld("remotedb", "remotefwl");
+        SeedRemoteWorld(new Dictionary<string, string>
+        {
+            ["_main.1.db2"] = "remotedb2",
+            ["_main.1.fwl2"] = "remotefwl2",
+            ["_main.1.chunks"] = "remoteidx",
+            ["_main.1.ok"] = "1",
+            ["1e_1e__1_1.chunk"] = "remoteChunk",
+        });
         _cloud.Locks[_world] = new WorldLock("Bob", DateTimeOffset.UtcNow);
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("remotedb", File.ReadAllText(LocalDb));
-        Assert.Equal("remotefwl", File.ReadAllText(LocalFwl));
-        // The replaced local save must survive as a .synbak safety copy.
-        Assert.Equal("localdb", File.ReadAllText(LocalDb + ".synbak"));
-        Assert.Equal("localfwl", File.ReadAllText(LocalFwl + ".synbak"));
-    }
-
-    [Fact]
-    public async Task Download_WhenRemoteNewer_AndNoOneHoldsLock()
-    {
-        if (GameIsRunning) return;
-        WriteLocal("localdb", "localfwl");
-        AgeLocalFiles();
-        SeedRemoteWorld("remotedb", "remotefwl");
-
-        await _engine.SyncNowAsync();
-
-        Assert.Equal("remotedb", File.ReadAllText(LocalDb));
+        Assert.Equal("remotedb2", File.ReadAllText(Path.Combine(WorldDir, "_main.1.db2")));
+        // The replaced local save must survive as a whole-folder .synbak safety copy.
+        Assert.Equal("localdb2", File.ReadAllText(Path.Combine(WorldDir + ".synbak", "_main.1.db2")));
     }
 
     [Fact]
     public async Task TornRemote_BlocksDivergenceDownload_Too()
     {
         if (GameIsRunning) return;
-        WriteLocal("localdb", "localfwl");
+        WriteLocal(1, db2: "localdb2", chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "localChunk" });
         AgeLocalFiles();
-        // Remote is newer but its marker certifies a different .db — refuse to download.
-        _cloud.Seed(DbName, "remotedb");
-        _cloud.Seed(FwlName, "remotefwl");
-        _cloud.Seed(CommitName, CommitFor("some-other-db", "remotefwl"));
+        // Remote is newer but its marker certifies a different db2 — refuse to download.
+        var files = new Dictionary<string, string>
+        {
+            ["_main.1.db2"] = "remotedb2",
+            ["_main.1.fwl2"] = "remotefwl2",
+            ["_main.1.chunks"] = "remoteidx",
+            ["_main.1.ok"] = "1",
+            ["1e_1e__1_1.chunk"] = "remoteChunk",
+        };
+        foreach (var (name, content) in files) _cloud.Seed(Prefix + name, content);
+        _cloud.Seed(ManifestName, CommitMarker.Content(new[]
+        {
+            (Prefix + "_main.1.db2", Hashing.Md5Text("some-other-content")),
+            (Prefix + "_main.1.fwl2", Hashing.Md5Text(files["_main.1.fwl2"])),
+            (Prefix + "_main.1.chunks", Hashing.Md5Text(files["_main.1.chunks"])),
+            (Prefix + "_main.1.ok", Hashing.Md5Text(files["_main.1.ok"])),
+            (Prefix + "1e_1e__1_1.chunk", Hashing.Md5Text(files["1e_1e__1_1.chunk"])),
+        }));
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("localdb", File.ReadAllText(LocalDb)); // untouched
+        Assert.Equal("localdb2", File.ReadAllText(Path.Combine(WorldDir, "_main.1.db2"))); // untouched
         Assert.Equal(SyncStatus.Error, _statuses.Last());
+    }
+
+    [Fact]
+    public async Task Download_ReplacesWholeFolder_AndKeepsSynbak()
+    {
+        if (GameIsRunning) return;
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "localChunk" });
+        AgeLocalFiles();
+        // Remote is a newer revision with a different chunk filename (zone was edited).
+        SeedRemoteWorld(new Dictionary<string, string>
+        {
+            ["_main.2.db2"] = "remoteDb2",
+            ["_main.2.fwl2"] = "remoteFwl2",
+            ["_main.2.chunks"] = "remoteIdx",
+            ["_main.2.ok"] = "1",
+            ["1e_1e__1_2.chunk"] = "remoteChunk",
+        });
+
+        await _engine.SyncNowAsync();
+
+        Assert.Equal("remoteDb2", File.ReadAllText(Path.Combine(WorldDir, "_main.2.db2")));
+        // The old revision's files must not linger next to the new one.
+        Assert.False(File.Exists(Path.Combine(WorldDir, "_main.1.db2")));
+        Assert.False(File.Exists(Path.Combine(WorldDir, "1e_1e__1_1.chunk")));
+        // The whole replaced folder survives as a single .synbak safety copy.
+        var backupDb2 = Path.Combine(WorldDir + ".synbak", "_main.1.db2");
+        Assert.Equal("db2", File.ReadAllText(backupDb2));
     }
 
     [Fact]
     public async Task CorruptDownload_Aborts_LeavesLocalUntouched()
     {
         if (GameIsRunning) return;
-        SeedRemoteWorld("realcontent", "realfwl");
+        SeedRemoteWorld(OneRevision());
         _cloud.CorruptDownloads = true;
 
         await _engine.SyncNowAsync();
 
-        // Hash verification must reject the corrupt download before touching the worlds dir.
         Assert.Equal(SyncStatus.Error, _statuses.Last());
-        Assert.False(File.Exists(LocalDb));
-        Assert.False(File.Exists(LocalFwl));
+        Assert.False(Directory.Exists(WorldDir));
     }
 
-    // ---- upload paths ----------------------------------------------------
+    // ---- upload paths ------------------------------------------------------
 
     [Fact]
-    public async Task Upload_WhenRemoteMissing_DbThenFwlThenCommit_NoBackup()
+    public async Task Upload_WhenRemoteMissing_UploadsEveryFile_MarkerLast()
     {
         if (GameIsRunning) return;
-        WriteLocal("mydb", "myfwl");
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("mydb", _cloud.ContentOf(DbName));
-        Assert.Equal("myfwl", _cloud.ContentOf(FwlName));
-        // The marker goes up LAST and must certify exactly the pair just uploaded.
-        Assert.Equal(CommitFor("mydb", "myfwl"), _cloud.ContentOf(CommitName));
-        Assert.Equal(new[] { $"upload:{DbName}", $"upload:{FwlName}", $"upload:{CommitName}" },
-            _cloud.Calls);
-        Assert.False(_cloud.Files.ContainsKey(DbName + ".bak"));
+        Assert.Equal("db2", _cloud.ContentOf(Prefix + "_main.1.db2"));
+        Assert.Equal("chunkA", _cloud.ContentOf(Prefix + "1e_1e__1_1.chunk"));
+        Assert.Equal(ManifestName, _cloud.Calls.Last().Split(':')[1]); // marker uploaded last
+        Assert.DoesNotContain(_cloud.Calls, c => c.StartsWith("copy:")); // nothing remote to back up yet
         Assert.Equal(SyncStatus.InSync, _statuses.Last());
-    }
-
-    [Fact]
-    public async Task Upload_WithExistingRemote_BacksUpBeforeOverwriting()
-    {
-        if (GameIsRunning) return;
-        WriteLocal("newdb", "newfwl");
-        SeedRemoteWorld("olddb", "oldfwl", DateTimeOffset.UtcNow.AddDays(-1));
-
-        await _engine.SyncNowAsync();
-
-        Assert.Equal("newdb", _cloud.ContentOf(DbName));
-        Assert.Equal("olddb", _cloud.ContentOf(DbName + ".bak"));
-        Assert.Equal("oldfwl", _cloud.ContentOf(FwlName + ".bak"));
-        Assert.Equal(CommitFor("olddb", "oldfwl"), _cloud.ContentOf(CommitName + ".bak"));
-        // Backup strictly precedes the overwrite; .db → .fwl → commit marker.
-        Assert.Equal(new[]
-        {
-            $"copy:{DbName}->{DbName}.bak",
-            $"copy:{FwlName}->{FwlName}.bak",
-            $"copy:{CommitName}->{CommitName}.bak",
-            $"upload:{DbName}",
-            $"upload:{FwlName}",
-            $"upload:{CommitName}",
-        }, _cloud.Calls);
-    }
-
-    [Fact]
-    public async Task Backup_OnlyOncePerSession()
-    {
-        if (GameIsRunning) return;
-        WriteLocal("v2", "fwl2");
-        SeedRemoteWorld("v1", "fwl1", DateTimeOffset.UtcNow.AddDays(-1));
-
-        await _engine.SyncNowAsync();          // first upload of the session → backs up v1
-        File.WriteAllText(LocalDb, "v3");      // played some more…
-        await _engine.SyncNowAsync();          // second upload → must NOT back up again
-
-        Assert.Equal("v3", _cloud.ContentOf(DbName));
-        // The backup still holds the PRE-SESSION state, not the mid-session one.
-        Assert.Equal("v1", _cloud.ContentOf(DbName + ".bak"));
-        Assert.Equal(3, _cloud.Calls.Count(c => c.StartsWith("copy:")));
-        Assert.Equal(6, _cloud.Calls.Count(c => c.StartsWith("upload:")));
-    }
-
-    [Fact]
-    public async Task Backup_NotRepeated_AfterAppRestart_MidSession()
-    {
-        if (GameIsRunning) return;
-        WriteLocal("v2", "fwl2");
-        SeedRemoteWorld("v1", "fwl1", DateTimeOffset.UtcNow.AddDays(-1));
-
-        await _engine.SyncNowAsync();          // backs up the pre-session v1
-        Assert.Equal("v1", _cloud.ContentOf(DbName + ".bak"));
-
-        // Simulate the app restarting mid-session: a brand-new engine, same persisted
-        // session state file. Before persistence this re-backed-up and destroyed the
-        // pre-session snapshot with mid-session state.
-        await _engine.DisposeAsync();
-        var engine2 = new SyncEngine(_settings, _cloud, null, SessionStatePath);
-        File.WriteAllText(LocalDb, "v3");
-        await engine2.SyncNowAsync();
-        await engine2.DisposeAsync();
-
-        Assert.Equal("v3", _cloud.ContentOf(DbName));
-        Assert.Equal("v1", _cloud.ContentOf(DbName + ".bak")); // snapshot survived the restart
-        Assert.Equal(3, _cloud.Calls.Count(c => c.StartsWith("copy:")));
     }
 
     [Fact]
     public async Task Upload_WhenIHoldLock_EvenIfRemoteIsNewer()
     {
         if (GameIsRunning) return;
-        WriteLocal("mydb", "myfwl");
+        WriteLocal(1, db2: "mydb2", chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "myChunk" });
         AgeLocalFiles(); // remote looks newer by timestamp…
-        SeedRemoteWorld("remotedb", "remotefwl");
+        SeedRemoteWorld(new Dictionary<string, string>
+        {
+            ["_main.1.db2"] = "remotedb2",
+            ["_main.1.fwl2"] = "remotefwl2",
+            ["_main.1.chunks"] = "remoteidx",
+            ["_main.1.ok"] = "1",
+            ["1e_1e__1_1.chunk"] = "remoteChunk",
+        });
         _cloud.Locks[_world] = new WorldLock("me", DateTimeOffset.UtcNow); // …but the lock is mine
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("mydb", _cloud.ContentOf(DbName));
+        Assert.Equal("mydb2", _cloud.ContentOf(Prefix + "_main.1.db2"));
     }
 
-    // ---- no-op paths -------------------------------------------------------
-
     [Fact]
-    public async Task NoTransfer_WhenDbHashesMatch()
+    public async Task Upload_SkipsUnchangedChunks_ButUploadsChangedOnes()
     {
         if (GameIsRunning) return;
-        WriteLocal("same", "localfwl");
-        SeedRemoteWorld("same", "remotefwl");
+        // Remote already has revision 1 with an untouched chunk; local has moved on to
+        // revision 2 where only that chunk's zone changed (new filename, new content) —
+        // the world's other file (a second, unmodified chunk) keeps its exact name.
+        SeedRemoteWorld(new Dictionary<string, string>
+        {
+            ["_main.1.db2"] = "db2v1",
+            ["_main.1.fwl2"] = "fwl2v1",
+            ["_main.1.chunks"] = "idxv1",
+            ["_main.1.ok"] = "1",
+            ["1e_1e__1_1.chunk"] = "unchanged",
+            ["20_20__1_1.chunk"] = "willChange",
+        }, DateTimeOffset.UtcNow.AddDays(-1));
+
+        Directory.CreateDirectory(WorldDir);
+        File.WriteAllText(Path.Combine(WorldDir, "_main.2.db2"), "db2v2");
+        File.WriteAllText(Path.Combine(WorldDir, "_main.2.fwl2"), "fwl2v2");
+        File.WriteAllText(Path.Combine(WorldDir, "_main.2.chunks"), "idxv2");
+        File.WriteAllText(Path.Combine(WorldDir, "_main.2.ok"), "1");
+        File.WriteAllText(Path.Combine(WorldDir, "1e_1e__1_1.chunk"), "unchanged"); // same content, same name
+        File.WriteAllText(Path.Combine(WorldDir, "20_20__1_2.chunk"), "changed"); // new name+content
+
+        await _engine.SyncNowAsync();
+
+        Assert.DoesNotContain(_cloud.Calls, c => c == $"upload:{Prefix}1e_1e__1_1.chunk");
+        Assert.Contains(_cloud.Calls, c => c == $"upload:{Prefix}20_20__1_2.chunk");
+        // Superseded revision-1 main files and the old chunk name are gone from the remote.
+        Assert.False(_cloud.Files.ContainsKey(Prefix + "_main.1.db2"));
+        Assert.False(_cloud.Files.ContainsKey(Prefix + "20_20__1_1.chunk"));
+        Assert.True(_cloud.Files.ContainsKey(Prefix + "1e_1e__1_1.chunk"));
+    }
+
+    [Fact]
+    public async Task Upload_WithExistingRemote_BacksUpBeforeOverwriting()
+    {
+        if (GameIsRunning) return;
+        WriteLocal(2, db2: "newdb2");
+        SeedRemoteWorld(new Dictionary<string, string>
+        {
+            ["_main.1.db2"] = "olddb2",
+            ["_main.1.fwl2"] = "oldfwl2",
+            ["_main.1.chunks"] = "oldidx",
+            ["_main.1.ok"] = "1",
+        }, DateTimeOffset.UtcNow.AddDays(-1));
+
+        await _engine.SyncNowAsync();
+
+        Assert.Equal("olddb2", _cloud.ContentOf(_world + ".bak/_main.1.db2"));
+        Assert.Equal("newdb2", _cloud.ContentOf(Prefix + "_main.2.db2"));
+        // Backup strictly precedes the overwrite.
+        var backupIndex = _cloud.Calls.ToList().FindLastIndex(c => c.StartsWith("copy:"));
+        var uploadIndex = _cloud.Calls.ToList().FindIndex(c => c.StartsWith("upload:"));
+        Assert.True(backupIndex < uploadIndex);
+    }
+
+    [Fact]
+    public async Task Backup_OnlyOncePerSession()
+    {
+        if (GameIsRunning) return;
+        WriteLocal(2, db2: "v2");
+        SeedRemoteWorld(new Dictionary<string, string>
+        {
+            ["_main.1.db2"] = "v1",
+            ["_main.1.fwl2"] = "fwl1",
+            ["_main.1.chunks"] = "idx1",
+            ["_main.1.ok"] = "1",
+        }, DateTimeOffset.UtcNow.AddDays(-1));
+
+        await _engine.SyncNowAsync();
+        var db2Path = Path.Combine(WorldDir, "_main.2.db2");
+        File.WriteAllText(db2Path, "v3"); // played some more…
+        // NTFS can cache a file's last-write time and occasionally serve it stale to an
+        // immediate re-read under I/O load, which would make this write look older than
+        // the remote's just-set upload timestamp and flip the next sync to a (wrong)
+        // download. Nudge it forward so the ordering is unambiguous either way.
+        File.SetLastWriteTimeUtc(db2Path, DateTime.UtcNow.AddSeconds(2));
+        await _engine.SyncNowAsync();     // must NOT back up again
+
+        Assert.Equal("v3", _cloud.ContentOf(Prefix + "_main.2.db2"));
+        Assert.Equal("v1", _cloud.ContentOf(_world + ".bak/_main.1.db2"));
+    }
+
+    [Fact]
+    public async Task Backup_NotRepeated_AfterAppRestart_MidSession()
+    {
+        if (GameIsRunning) return;
+        WriteLocal(2, db2: "v2");
+        SeedRemoteWorld(new Dictionary<string, string>
+        {
+            ["_main.1.db2"] = "v1",
+            ["_main.1.fwl2"] = "fwl1",
+            ["_main.1.chunks"] = "idx1",
+            ["_main.1.ok"] = "1",
+        }, DateTimeOffset.UtcNow.AddDays(-1));
+
+        await _engine.SyncNowAsync(); // backs up the pre-session v1
+        Assert.Equal("v1", _cloud.ContentOf(_world + ".bak/_main.1.db2"));
+
+        // Simulate the app restarting mid-session: a brand-new engine, same persisted
+        // session state file. Before persistence this re-backed-up and destroyed the
+        // pre-session snapshot with mid-session state.
+        await _engine.DisposeAsync();
+        var engine2 = new SyncEngine(_settings, _cloud, null, SessionStatePath);
+        var db2Path = Path.Combine(WorldDir, "_main.2.db2");
+        File.WriteAllText(db2Path, "v3");
+        File.SetLastWriteTimeUtc(db2Path, DateTime.UtcNow.AddSeconds(2)); // see Backup_OnlyOncePerSession
+        await engine2.SyncNowAsync();
+        await engine2.DisposeAsync();
+
+        Assert.Equal("v3", _cloud.ContentOf(Prefix + "_main.2.db2"));
+        Assert.Equal("v1", _cloud.ContentOf(_world + ".bak/_main.1.db2")); // snapshot survived the restart
+    }
+
+    // ---- no-op / repair paths -----------------------------------------------
+
+    [Fact]
+    public async Task NoTransfer_WhenFileSetMatches()
+    {
+        if (GameIsRunning) return;
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+        SeedRemoteWorld(OneRevision());
 
         await _engine.SyncNowAsync();
 
@@ -307,35 +416,58 @@ public sealed class SyncEngineTests : IDisposable
     }
 
     [Fact]
-    public async Task FwlOnlyChange_IsIgnored_KnownLimitation()
+    public async Task Fwl2OnlyChange_TriggersUpload()
     {
         if (GameIsRunning) return;
-        // Documents current behavior: sync direction is decided by the .db hash alone, so a
-        // .fwl that diverges while the .db matches is never re-synced. Acceptable because
-        // Valheim rewrites both on save, but worth knowing.
-        WriteLocal("same", "DIFFERENT-local-fwl");
-        SeedRemoteWorld("same", "remote-fwl");
+        // Direction is decided by comparing the whole file set, so a metadata-only
+        // change (fwl2 diverges while db2 matches) is not ignored.
+        WriteLocal(1, db2: "same", fwl2: "DIFFERENT-local-fwl2",
+            chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+        SeedRemoteWorld(new Dictionary<string, string>
+        {
+            ["_main.1.db2"] = "same",
+            ["_main.1.fwl2"] = "remote-fwl2",
+            ["_main.1.chunks"] = "idx",
+            ["_main.1.ok"] = "1",
+            ["1e_1e__1_1.chunk"] = "chunkA",
+        }, DateTimeOffset.UtcNow.AddDays(-1)); // older than local, so local wins deterministically
 
         await _engine.SyncNowAsync();
 
-        Assert.Empty(_cloud.Calls);
-        Assert.Equal("remote-fwl", _cloud.ContentOf(FwlName)); // untouched
+        Assert.Equal("DIFFERENT-local-fwl2", _cloud.ContentOf(Prefix + "_main.1.fwl2"));
     }
 
-    // ---- self-heal paths ---------------------------------------------------
-
     [Fact]
-    public async Task LegacyRemote_GetsCommitMarker_WhenLocalMatches()
+    public async Task MissingRemoteFile_IsCompleted_ViaNormalUpload_NotRepairPath()
     {
         if (GameIsRunning) return;
-        WriteLocal("same", "fwl");
-        SeedRemoteWorld("same", "fwl", withCommit: false); // pre-marker remote
+        // A file set with anything missing simply isn't a "match" — it's resolved
+        // through the normal upload path, which fills the gap as a side effect (there's
+        // no separate partial-completion / repair path for a missing file).
+        WriteLocal(1, db2: "same", chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+        // The db2 made it up but the rest of the upload died, and it predates local.
+        _cloud.Seed(Prefix + "_main.1.db2", "same", DateTimeOffset.UtcNow.AddDays(-1));
 
         await _engine.SyncNowAsync();
 
-        // Migrated in place: exactly one marker upload, describing the existing pair.
-        Assert.Equal(new[] { $"upload:{CommitName}" }, _cloud.Calls);
-        Assert.Equal(CommitFor("same", "fwl"), _cloud.ContentOf(CommitName));
+        Assert.Equal("fwl2", _cloud.ContentOf(Prefix + "_main.1.fwl2"));
+        Assert.Equal(ManifestName, _cloud.Calls.Last().Split(':')[1]); // marker uploaded last, as always
+    }
+
+    [Fact]
+    public async Task UnrelatedRemoteFiles_AreInert()
+    {
+        if (GameIsRunning) return;
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+        SeedRemoteWorld(OneRevision());
+        // Another world's files, and this world's lock file — neither should be mistaken
+        // for part of this world's manifest.
+        _cloud.Seed("SomeOtherWorld/_main.1.db2", "unrelated");
+        _cloud.Seed(_world + ".lock", "{}");
+
+        await _engine.SyncNowAsync();
+
+        Assert.Empty(_cloud.Calls); // nothing mistaken for this world's files
         Assert.Equal(SyncStatus.InSync, _statuses.Last());
     }
 
@@ -343,46 +475,28 @@ public sealed class SyncEngineTests : IDisposable
     public async Task StaleMarker_IsRepaired_WhenLocalMatches()
     {
         if (GameIsRunning) return;
-        // Pair is fully uploaded but the marker upload failed last time (marker still
-        // describes the previous version). A matching client must rewrite it.
-        WriteLocal("v2", "fwl2");
-        _cloud.Seed(DbName, "v2");
-        _cloud.Seed(FwlName, "fwl2");
-        _cloud.Seed(CommitName, CommitFor("v1", "fwl1"));
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+        var files = OneRevision();
+        foreach (var (name, content) in files) _cloud.Seed(Prefix + name, content);
+        _cloud.Seed(ManifestName, "garbage-from-a-failed-upload");
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal(new[] { $"upload:{CommitName}" }, _cloud.Calls);
-        Assert.Equal(CommitFor("v2", "fwl2"), _cloud.ContentOf(CommitName));
-    }
-
-    [Fact]
-    public async Task MissingRemoteFwl_IsCompleted_FromMatchingLocal()
-    {
-        if (GameIsRunning) return;
-        // The .db made it up but the .fwl upload died. Our local .db is identical, so our
-        // local .fwl is the right other half — finish the pair and certify it.
-        WriteLocal("same", "myfwl");
-        _cloud.Seed(DbName, "same");
-
-        await _engine.SyncNowAsync();
-
-        Assert.Equal("myfwl", _cloud.ContentOf(FwlName));
-        Assert.Equal(CommitFor("same", "myfwl"), _cloud.ContentOf(CommitName));
-        Assert.Equal(new[] { $"upload:{FwlName}", $"upload:{CommitName}" }, _cloud.Calls);
+        Assert.Equal(new[] { $"upload:{ManifestName}" }, _cloud.Calls);
+        Assert.Equal(SyncStatus.InSync, _statuses.Last());
     }
 
     [Fact]
     public async Task NoRepair_WhileSomeoneElseHoldsTheLock()
     {
         if (GameIsRunning) return;
-        WriteLocal("same", "fwl");
-        SeedRemoteWorld("same", "fwl", withCommit: false);
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+        SeedRemoteWorld(OneRevision(), withMarker: false);
         _cloud.Locks[_world] = new WorldLock("Bob", DateTimeOffset.UtcNow);
 
         await _engine.SyncNowAsync();
 
-        Assert.Empty(_cloud.Calls); // Bob is mid-session — don't touch his world's files
+        Assert.Empty(_cloud.Calls);
         Assert.Equal(SyncStatus.LockedByOther, _statuses.Last());
     }
 
@@ -391,8 +505,8 @@ public sealed class SyncEngineTests : IDisposable
     {
         if (GameIsRunning) return;
         _settings.SelectedWorlds.Clear();
-        WriteLocal("localdb", "localfwl");
-        _cloud.Seed(DbName, "remotedb");
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+        _cloud.Seed(Prefix + "_main.1.db2", "remotedb2");
 
         await _engine.SyncNowAsync();
 
@@ -400,21 +514,22 @@ public sealed class SyncEngineTests : IDisposable
         Assert.Empty(_statuses);
     }
 
+    // ---- LocalLow mirroring -------------------------------------------------
+
     [Fact]
-    public async Task BakAndLockFiles_InRemoteFolder_AreInert()
+    public async Task Download_MirrorsWholeFolderIntoLocalLow_ForInGameVisibility()
     {
         if (GameIsRunning) return;
-        WriteLocal("same", "fwl");
-        SeedRemoteWorld("same", "fwl");
-        _cloud.Seed(DbName + ".bak", "old");
-        _cloud.Seed(FwlName + ".bak", "old");
-        _cloud.Seed(CommitName + ".bak", "old");
-        _cloud.Seed(_world + ".lock", "{}");
+        SeedRemoteWorld(OneRevision());
 
         await _engine.SyncNowAsync();
 
-        Assert.Empty(_cloud.Calls); // nothing mistaken for a world file
-        Assert.Equal(SyncStatus.InSync, _statuses.Last());
+        var localLow = ValheimSaveLocations.ResolveLocalLowWorldsFolder();
+        if (localLow is null) return; // this machine has no LocalLow folder — nothing to check
+        var mirrored = Path.Combine(localLow, _world);
+        Assert.True(Directory.Exists(mirrored));
+        Assert.Equal("db2", File.ReadAllText(Path.Combine(mirrored, "_main.1.db2")));
+        Assert.Equal("chunkA", File.ReadAllText(Path.Combine(mirrored, "1e_1e__1_1.chunk")));
     }
 
     // -----------------------------------------------------------------------
@@ -424,16 +539,16 @@ public sealed class SyncEngineTests : IDisposable
         _engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
         try { Directory.Delete(_dir, recursive: true); } catch { }
 
-        // Downloads best-effort mirror into the machine's real Valheim LocalLow folder;
-        // remove this test's uniquely-named world files if they landed there.
+        // Downloads best-effort mirror the whole world folder into the machine's real
+        // Valheim LocalLow folder; remove this test's uniquely-named world if it landed there.
         try
         {
             var localLow = ValheimSaveLocations.ResolveLocalLowWorldsFolder();
             if (localLow is not null)
-                foreach (var suffix in new[] { ".db", ".fwl", ".db.synbak", ".fwl.synbak" })
+                foreach (var suffix in new[] { "", ".synbak" })
                 {
                     var p = Path.Combine(localLow, _world + suffix);
-                    if (File.Exists(p)) File.Delete(p);
+                    if (Directory.Exists(p)) Directory.Delete(p, recursive: true);
                 }
         }
         catch { }

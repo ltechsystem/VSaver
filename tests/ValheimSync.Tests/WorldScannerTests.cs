@@ -9,47 +9,94 @@ public sealed class WorldScannerTests : IDisposable
 
     public WorldScannerTests() => Directory.CreateDirectory(_dir);
 
-    private void Touch(string name) => File.WriteAllText(Path.Combine(_dir, name), "x");
+    private string WorldDir(string name)
+    {
+        var dir = Path.Combine(_dir, name);
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private static void Touch(string dir, string fileName) => File.WriteAllText(Path.Combine(dir, fileName), "x");
+
+    private static void WriteRevision(string dir, int revision, params string[] chunkNames)
+    {
+        Touch(dir, $"_main.{revision}.db2");
+        Touch(dir, $"_main.{revision}.fwl2");
+        Touch(dir, $"_main.{revision}.chunks");
+        Touch(dir, $"_main.{revision}.ok");
+        foreach (var chunk in chunkNames) Touch(dir, chunk);
+    }
 
     [Fact]
-    public void FindsDbFwlPairs_SortedCaseInsensitively()
+    public void FindsCompleteRevision_WithItsChunkFiles()
     {
-        Touch("beta.fwl"); Touch("beta.db");
-        Touch("Alpha.fwl"); Touch("Alpha.db");
+        var dir = WorldDir("Alpha");
+        WriteRevision(dir, 1, "1e_1e__1_1.chunk", "1e_20__1_1.chunk");
+
+        var worlds = WorldScanner.Scan(_dir);
+
+        var world = Assert.Single(worlds);
+        Assert.Equal("Alpha", world.Name);
+        Assert.Equal(1, world.Revision);
+        Assert.Equal(2, world.ChunkPaths.Count);
+        Assert.All(world.AllFilePaths, p => Assert.True(File.Exists(p)));
+    }
+
+    [Fact]
+    public void SortedCaseInsensitively()
+    {
+        WriteRevision(WorldDir("beta"), 1);
+        WriteRevision(WorldDir("Alpha"), 1);
 
         var worlds = WorldScanner.Scan(_dir);
 
         Assert.Equal(new[] { "Alpha", "beta" }, worlds.Select(w => w.Name));
-        Assert.All(worlds, w => Assert.True(File.Exists(w.DbPath) && File.Exists(w.FwlPath)));
     }
 
     [Fact]
-    public void IgnoresValheimBackupFiles_AndOldExtension()
+    public void IncompleteRevision_WithNoEarlierComplete_IsNotListed()
     {
-        Touch("Midgard.fwl"); Touch("Midgard.db");
-        Touch("Midgard_backup_auto-20240101.fwl");
-        Touch("Midgard_backup_auto-20240101.db");
-        Touch("Midgard.fwl.old");
-        Touch("Midgard.db.old");
+        // Mirrors a freshly created world: Valheim has written the metadata file but
+        // hasn't finished (or even started) a real save yet — no .db2/.chunks/.ok.
+        Touch(WorldDir("Newborn"), "_main.0.fwl2");
 
-        var worlds = WorldScanner.Scan(_dir);
-
-        Assert.Single(worlds);
-        Assert.Equal("Midgard", worlds[0].Name);
+        Assert.Empty(WorldScanner.Scan(_dir));
     }
 
     [Fact]
-    public void FwlWithoutDb_IsStillListed_KnownLimitation()
+    public void IncompleteLatestRevision_FallsBackToPreviousComplete()
     {
-        // Documents current behavior: the scanner keys off .fwl alone, so a world whose .db
-        // is missing (e.g. mid-first-write) is returned anyway — an upload attempt on it
-        // would throw when opening the .db. See flaw summary.
-        Touch("Lonely.fwl");
+        // A save-in-progress: revision 2's .ok hasn't landed yet, but revision 1 (the
+        // previous completed save) is still fully intact on disk.
+        var dir = WorldDir("MidSave");
+        WriteRevision(dir, 1, "1e_1e__1_1.chunk");
+        Touch(dir, "_main.2.db2");
+        Touch(dir, "_main.2.fwl2");
+        // no _main.2.ok — revision 2 is not yet certified complete
 
-        var worlds = WorldScanner.Scan(_dir);
+        var world = Assert.Single(WorldScanner.Scan(_dir));
+        Assert.Equal(1, world.Revision);
+    }
 
-        Assert.Single(worlds);
-        Assert.False(File.Exists(worlds[0].DbPath));
+    [Fact]
+    public void BackupSnapshotFolders_AreIgnored()
+    {
+        WriteRevision(WorldDir("World"), 1, "1e_1e__1_1.chunk");
+        Touch(WorldDir("World_backup_auto-20260909-172620"), "_main.0.fwl2");
+
+        var world = Assert.Single(WorldScanner.Scan(_dir));
+        Assert.Equal("World", world.Name);
+    }
+
+    [Fact]
+    public void ChunksIndexFile_IsNotTreatedAsAChunkFile()
+    {
+        // "_main.<N>.chunks" (the index) must not be picked up by the ".chunk" glob.
+        var dir = WorldDir("World");
+        WriteRevision(dir, 1, "1e_1e__1_1.chunk");
+
+        var world = Assert.Single(WorldScanner.Scan(_dir));
+        Assert.DoesNotContain(world.ChunkPaths, p => p.EndsWith(".chunks", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

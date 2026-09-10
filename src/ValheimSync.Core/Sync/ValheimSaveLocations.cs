@@ -44,7 +44,7 @@ public static class ValheimSaveLocations
             if (!Directory.Exists(folder)) continue;
             firstExisting ??= folder;
 
-            // Prefer a folder that actually contains a world (.fwl).
+            // Prefer a folder that actually contains a world.
             if (HasWorlds(folder)) return folder;
         }
 
@@ -53,9 +53,15 @@ public static class ValheimSaveLocations
         return firstExisting ?? throw new DirectoryNotFoundException(BuildError(checkedPaths));
     }
 
+    /// <summary>True if any immediate subfolder holds a world (identified by a
+    /// "_main.&lt;N&gt;.fwl2" inside it).</summary>
     private static bool HasWorlds(string folder)
     {
-        try { return Directory.EnumerateFiles(folder, "*.fwl").Any(); }
+        try
+        {
+            return SafeEnumerateDirectories(folder)
+                .Any(dir => Directory.EnumerateFiles(dir, "_main.*.fwl2").Any());
+        }
         catch { return false; }
     }
 
@@ -136,7 +142,8 @@ public static class ValheimSaveLocations
     {
         try
         {
-            return Directory.EnumerateFiles(remote, "*.fwl", SearchOption.AllDirectories)
+            // Recursive — "*.fwl2" lives one folder down, inside each world's own subfolder.
+            return Directory.EnumerateFiles(remote, "*.fwl2", SearchOption.AllDirectories)
                 .Select(File.GetLastWriteTimeUtc)
                 .DefaultIfEmpty(DateTime.MinValue)
                 .Max();

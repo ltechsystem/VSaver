@@ -224,10 +224,12 @@ public partial class MainWindowViewModel : ObservableObject
         if (_cloud is null) return;
 
         var files = await _cloud.ListFilesAsync();
+        // A server is any file under a "<world>/" prefix — a world's save is many files
+        // (see CommitMarker), and the "/" grouping is what makes its name recoverable
+        // even though no single file is literally named "<world>.something".
         var serverNames = files
-            .Where(f => f.Name.EndsWith(".db", StringComparison.OrdinalIgnoreCase))
-            .Select(f => Path.GetFileNameWithoutExtension(f.Name))
-            .Where(n => !string.IsNullOrEmpty(n))
+            .Where(f => f.Name.Contains('/'))
+            .Select(f => f.Name[..f.Name.IndexOf('/')])
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -235,8 +237,8 @@ public partial class MainWindowViewModel : ObservableObject
         Worlds.Clear();
         foreach (var name in serverNames)
         {
-            var size = files.FirstOrDefault(f =>
-                f.Name.Equals($"{name}.db", StringComparison.OrdinalIgnoreCase))?.SizeBytes ?? 0;
+            var size = files.Where(f => f.Name.StartsWith($"{name}/", StringComparison.OrdinalIgnoreCase))
+                .Sum(f => f.SizeBytes);
 
             var item = new WorldItemViewModel(name, size) { IsSelected = true };
             item.SelectionChanged += OnWorldSelectionChanged;
@@ -448,11 +450,11 @@ public partial class MainWindowViewModel : ObservableObject
     private async Task AddServerAsync()
     {
         var name = SelectedAddableWorld;
-        if (name is null || _cloud is null) return;
+        if (name is null || _cloud is null || _engine is null) return;
 
-        var local = WorldScanner.Scan(_settings.WorldsPath)
-            .FirstOrDefault(w => string.Equals(w.Name, name, StringComparison.OrdinalIgnoreCase));
-        if (local is null)
+        bool existsLocally = WorldScanner.Scan(_settings.WorldsPath)
+            .Any(w => string.Equals(w.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (!existsLocally)
         {
             StatusText = $"Local world '{name}' not found.";
             return;
@@ -462,18 +464,33 @@ public partial class MainWindowViewModel : ObservableObject
         try
         {
             StatusText = $"Publishing '{name}' to the cloud...";
-            // .db first, .fwl last — the .fwl is the commit marker (same rule as the engine).
-            await _cloud.UploadAsync(local.DbPath, local.DbFileName);
-            await _cloud.UploadAsync(local.FwlPath, local.FwlFileName);
-
             _settings.SelectedWorlds.Add(name);
             _settings.Save();
 
+            // SyncEngine already knows how to publish a brand-new world — it's the same
+            // "nothing remote yet" upload path it uses for every other sync, so there's
+            // nothing to hand-roll here. The engine never throws on a failed sync (it logs
+            // and sets a per-world error status instead), so success is judged by whether
+            // the world actually shows up remotely afterward — and rolled back from
+            // SelectedWorlds if not.
+            await _engine.SyncNowAsync();
             await RefreshServersAsync();
-            StatusText = $"'{name}' is now a server.";
+
+            if (Worlds.Any(w => string.Equals(w.Name, name, StringComparison.OrdinalIgnoreCase)))
+            {
+                StatusText = $"'{name}' is now a server.";
+            }
+            else
+            {
+                _settings.SelectedWorlds.Remove(name);
+                _settings.Save();
+                StatusText = $"Couldn't add '{name}' — check the log for details.";
+            }
         }
         catch (Exception ex)
         {
+            _settings.SelectedWorlds.Remove(name);
+            _settings.Save();
             StatusText = $"Couldn't add '{name}': {ex.Message}";
         }
         finally

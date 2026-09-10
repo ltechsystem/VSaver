@@ -105,7 +105,11 @@ if ($Publish) {
         throw "The GitHub CLI (gh) is not installed or not on PATH - cannot -Publish."
     }
     Write-Host "Creating GitHub Release $tag (VSaver.exe + install zip)..." -ForegroundColor Cyan
-    & gh release create $tag $exe $zip --title $tag --notes $Notes
+    # Build the arg list so an empty -Notes doesn't leave a dangling --notes flag; fall back
+    # to GitHub's auto-generated notes when none are supplied.
+    $ghArgs = @("release", "create", $tag, $exe, $zip, "--title", $tag)
+    if ($Notes) { $ghArgs += @("--notes", $Notes) } else { $ghArgs += "--generate-notes" }
+    & gh @ghArgs
     if ($LASTEXITCODE -ne 0) { throw "gh release create failed." }
     Write-Host "Released $tag with both the bare exe and the first-time-install zip." -ForegroundColor Green
 } else {

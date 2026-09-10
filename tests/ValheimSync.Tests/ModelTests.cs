@@ -25,30 +25,62 @@ public sealed class WorldSaveTests : IDisposable
 
     public WorldSaveTests() => Directory.CreateDirectory(_dir);
 
-    [Fact]
-    public void FileNames_ComeFromPaths()
+    private string Write(string name, int bytes)
     {
-        var w = new WorldSave("Midgard", Path.Combine(_dir, "Midgard.db"), Path.Combine(_dir, "Midgard.fwl"));
-        Assert.Equal("Midgard.db", w.DbFileName);
-        Assert.Equal("Midgard.fwl", w.FwlFileName);
+        var path = Path.Combine(_dir, name);
+        File.WriteAllBytes(path, new byte[bytes]);
+        return path;
     }
 
     [Fact]
-    public void SizeBytes_SumsBothFiles_MissingCountsAsZero()
+    public void SizeBytes_SumsMainFilesAndChunks()
     {
-        var db = Path.Combine(_dir, "W.db");
-        var fwl = Path.Combine(_dir, "W.fwl");
-        File.WriteAllBytes(db, new byte[10]);
-        File.WriteAllBytes(fwl, new byte[3]);
+        var db2 = Write("_main.1.db2", 10);
+        var fwl2 = Write("_main.1.fwl2", 3);
+        var chunksIndex = Write("_main.1.chunks", 2);
+        var ok = Write("_main.1.ok", 4);
+        var chunk = Write("1e_1e__1_1.chunk", 100);
 
-        Assert.Equal(13, new WorldSave("W", db, fwl).SizeBytes);
-        Assert.Equal(10, new WorldSave("W", db, Path.Combine(_dir, "missing.fwl")).SizeBytes);
+        var world = new WorldSave("W", _dir, 1, db2, fwl2, chunksIndex, ok, new[] { chunk });
+
+        Assert.Equal(119, world.SizeBytes);
     }
 
     [Fact]
-    public void LastWriteUtc_IsMinValue_WhenDbMissing() =>
-        Assert.Equal(DateTime.MinValue,
-            new WorldSave("W", Path.Combine(_dir, "nope.db"), Path.Combine(_dir, "nope.fwl")).LastWriteUtc);
+    public void SizeBytes_MissingFileCountsAsZero()
+    {
+        var db2 = Write("_main.1.db2", 10);
+        var world = new WorldSave("W", _dir, 1, db2,
+            Path.Combine(_dir, "missing.fwl2"), Path.Combine(_dir, "missing.chunks"),
+            Path.Combine(_dir, "missing.ok"), Array.Empty<string>());
+
+        Assert.Equal(10, world.SizeBytes);
+    }
+
+    [Fact]
+    public void LastWriteUtc_IsMinValue_WhenNothingExists()
+    {
+        var world = new WorldSave("W", _dir, 1,
+            Path.Combine(_dir, "nope.db2"), Path.Combine(_dir, "nope.fwl2"),
+            Path.Combine(_dir, "nope.chunks"), Path.Combine(_dir, "nope.ok"), Array.Empty<string>());
+
+        Assert.Equal(DateTime.MinValue, world.LastWriteUtc);
+    }
+
+    [Fact]
+    public void AllFilePaths_IncludesMainFilesAndEveryChunk()
+    {
+        var db2 = Write("_main.1.db2", 1);
+        var fwl2 = Write("_main.1.fwl2", 1);
+        var chunksIndex = Write("_main.1.chunks", 1);
+        var ok = Write("_main.1.ok", 1);
+        var chunkA = Write("1e_1e__1_1.chunk", 1);
+        var chunkB = Write("20_20__1_1.chunk", 1);
+
+        var world = new WorldSave("W", _dir, 1, db2, fwl2, chunksIndex, ok, new[] { chunkA, chunkB });
+
+        Assert.Equal(new[] { db2, fwl2, chunksIndex, ok, chunkA, chunkB }, world.AllFilePaths);
+    }
 
     public void Dispose()
     {
