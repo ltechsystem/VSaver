@@ -48,6 +48,10 @@ Double-click **`VSaver.exe`**.
    **Continue / Advanced → Go to VSaver** and allow access.
 5. Tick the world(s) you want to sync.
 
+> ⚠️ **Your world must already be in Valheim's current save format.** If a world you expect to
+> see isn't listed, open it in an up-to-date Valheim once — it upgrades the save automatically —
+> then reopen VSaver.
+
 ---
 
 ## 4. Playing — respect the lock
