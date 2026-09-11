@@ -27,6 +27,14 @@ public sealed class SyncEngine : IAsyncDisposable
     private readonly ICloudStorageProvider _cloud;
     private readonly ILogger _log;
     private readonly SemaphoreSlim _syncGate = new(1, 1); // one sync at a time
+
+    // A stalled Drive call (dead connection, huge first-time download, an API request
+    // that never completes) must not hang a world's sync forever — since every sync
+    // shares _syncGate, an unbounded hang for one world would starve every other
+    // world's sync behind it too. This bounds a single world's sync pass so it always
+    // eventually fails and frees the gate for a retry on the next poll instead.
+    // Overridable only so tests can verify the timeout path without waiting 15 minutes.
+    private readonly TimeSpan _syncTimeout;
     private DebouncedWorldWatcher? _watcher;
     private PeriodicTimer? _timer;
     private PeriodicTimer? _inGameTimer;
@@ -44,11 +52,12 @@ public sealed class SyncEngine : IAsyncDisposable
     public event Action<string>? Log;
 
     public SyncEngine(AppSettings settings, ICloudStorageProvider cloud, ILogger? log = null,
-        string? sessionStatePath = null)
+        string? sessionStatePath = null, TimeSpan? syncTimeout = null)
     {
         _settings = settings;
         _cloud = cloud;
         _log = log ?? NullLogger.Instance;
+        _syncTimeout = syncTimeout ?? TimeSpan.FromMinutes(15);
         _sessionStatePath = sessionStatePath ?? BackupSessionState.DefaultPath;
         _session = BackupSessionState.Load(_sessionStatePath);
     }
@@ -108,7 +117,18 @@ public sealed class SyncEngine : IAsyncDisposable
         try
         {
             UpdateSessionState();
-            await SyncWorldAsync(worldName, ct, allowUploadWhileRunning);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(_syncTimeout);
+            await SyncWorldAsync(worldName, timeoutCts.Token, allowUploadWhileRunning);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // The linked token fired from CancelAfter, not from the caller — a stalled
+            // transfer, not a real shutdown/cancellation.
+            _log.LogError("Sync timed out for {World}", worldName);
+            Info($"[{worldName}] Sync timed out after {_syncTimeout.TotalMinutes:F0} minutes " +
+                 "(a file transfer likely stalled) — will retry on the next sync.");
+            WorldStatusChanged?.Invoke(worldName, SyncStatus.Error);
         }
         catch (Exception ex)
         {
@@ -197,7 +217,35 @@ public sealed class SyncEngine : IAsyncDisposable
                 }
                 Info($"[{worldName}] Valheim running — pushing in-progress save.");
             }
-            await UploadWorldAsync(worldName, local, localHashes, remote, ct);
+
+            // If I don't already hold the lock (this is an opportunistic background
+            // upload — "no one holds the lock and my file isn't older" — rather than an
+            // active play session), grab it for the duration of the upload. Without this,
+            // two idle clients that both satisfy that condition at the same moment can
+            // race: their per-file uploads and stale-file cleanup interleave on the same
+            // "<world>/" prefix and corrupt the set, leaving a remote whose files don't
+            // hash to the marker (torn). Whoever loses the race sees the lock on its next
+            // pass and correctly downloads/skips instead of stepping on the winner.
+            bool tookLock = false;
+            if (!iHoldLock)
+            {
+                tookLock = await _cloud.TryAcquireLockAsync(worldName, _settings.PlayerName, ct);
+                if (!tookLock)
+                {
+                    Info($"[{worldName}] Another machine grabbed the lock just now — skipping this upload.");
+                    WorldStatusChanged?.Invoke(worldName, SyncStatus.LockedByOther);
+                    return;
+                }
+            }
+            try
+            {
+                await UploadWorldAsync(worldName, local, localHashes, remote, ct);
+            }
+            finally
+            {
+                if (tookLock)
+                    await _cloud.ReleaseLockAsync(worldName, _settings.PlayerName, ct);
+            }
         }
         else
         {

@@ -24,6 +24,16 @@ internal sealed class FakeCloudProvider : ICloudStorageProvider
     /// <summary>When true, downloads write garbage so hash verification must fail.</summary>
     public bool CorruptDownloads;
 
+    /// <summary>Test hook fired at the top of every <see cref="TryAcquireLockAsync"/> call,
+    /// before it checks the current lock — lets a test simulate another machine grabbing
+    /// the lock in the race window between the caller's own GetLockAsync check and its
+    /// TryAcquireLockAsync call.</summary>
+    public Action? OnTryAcquireLock;
+
+    /// <summary>When true, <see cref="DownloadAsync"/> hangs until its CancellationToken
+    /// fires, like a stalled real network call — used to test SyncEngine's sync timeout.</summary>
+    public bool HangDownloads;
+
     public string ProviderName => "Fake";
 
     public Task InitializeAsync(CancellationToken ct = default)
@@ -63,6 +73,8 @@ internal sealed class FakeCloudProvider : ICloudStorageProvider
     public async Task DownloadAsync(string remoteName, string localPath,
         IProgress<double>? progress = null, CancellationToken ct = default)
     {
+        if (HangDownloads)
+            await Task.Delay(Timeout.Infinite, ct); // stalled "network call" — only ct ends this
         if (!Files.TryGetValue(remoteName, out var f))
             throw new FileNotFoundException($"'{remoteName}' not found in fake cloud.");
         var bytes = CorruptDownloads ? Encoding.UTF8.GetBytes("corrupted!!") : f.Content;
@@ -93,6 +105,7 @@ internal sealed class FakeCloudProvider : ICloudStorageProvider
     public Task<bool> TryAcquireLockAsync(string worldName, string playerName,
         CancellationToken ct = default)
     {
+        OnTryAcquireLock?.Invoke();
         if (Locks.TryGetValue(worldName, out var cur) && !cur.IsStale &&
             !string.Equals(cur.PlayerName, playerName, StringComparison.OrdinalIgnoreCase))
             return Task.FromResult(false);

@@ -101,6 +101,52 @@ public sealed class SyncEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task StalledDownload_TimesOut_AndFreesTheGateForOtherWorlds()
+    {
+        if (GameIsRunning) return;
+        // A world whose download never returns (dead connection, huge first-time
+        // transfer) must not hang this world's sync forever — since every world shares
+        // one sync gate, that would starve every other world behind it too. Verify it
+        // times out to Error instead, and that the gate is free again afterward.
+        SeedRemoteWorld(OneRevision());
+        _cloud.HangDownloads = true;
+        await using var timeoutEngine = new SyncEngine(_settings, _cloud, null, SessionStatePath,
+            syncTimeout: TimeSpan.FromMilliseconds(200));
+        var statuses = new List<SyncStatus>();
+        timeoutEngine.WorldStatusChanged += (_, s) => statuses.Add(s);
+
+        await timeoutEngine.SyncNowAsync();
+
+        Assert.Equal(SyncStatus.Error, statuses.Last());
+        Assert.False(Directory.Exists(WorldDir)); // nothing partial landed locally
+
+        // The gate must be free again — a second world's sync must not be blocked by it.
+        _cloud.HangDownloads = false;
+        var secondWorld = "VSTestW2" + Guid.NewGuid().ToString("N")[..8];
+        _settings.SelectedWorlds.Add(secondWorld);
+        foreach (var (name, content) in OneRevision())
+            _cloud.Seed($"{secondWorld}/{name}", content);
+        _cloud.Seed(CommitMarker.Name(secondWorld), CommitMarker.Content(
+            OneRevision().Select(kv => ($"{secondWorld}/{kv.Key}", Hashing.Md5Text(kv.Value)))));
+
+        await timeoutEngine.SyncNowAsync();
+
+        Assert.True(Directory.Exists(Path.Combine(_dir, secondWorld)));
+        try { Directory.Delete(Path.Combine(_dir, secondWorld), recursive: true); } catch { }
+        try
+        {
+            var localLow = ValheimSaveLocations.ResolveLocalLowWorldsFolder();
+            if (localLow is not null)
+                foreach (var suffix in new[] { "", ".synbak" })
+                {
+                    var p = Path.Combine(localLow, secondWorld + suffix);
+                    if (Directory.Exists(p)) Directory.Delete(p, recursive: true);
+                }
+        }
+        catch { }
+    }
+
+    [Fact]
     public async Task TornRemote_MissingMarker_IsNotDownloaded()
     {
         if (GameIsRunning) return;
@@ -317,6 +363,52 @@ public sealed class SyncEngineTests : IDisposable
         Assert.False(_cloud.Files.ContainsKey(Prefix + "_main.1.db2"));
         Assert.False(_cloud.Files.ContainsKey(Prefix + "20_20__1_1.chunk"));
         Assert.True(_cloud.Files.ContainsKey(Prefix + "1e_1e__1_1.chunk"));
+    }
+
+    [Fact]
+    public async Task OpportunisticUpload_ReleasesLockAfterwards()
+    {
+        if (GameIsRunning) return;
+        // No one holds the lock and nothing is remote yet — this is the "opportunistic"
+        // background-upload branch (not an active play session), which must still take
+        // the world lock for the duration of the upload so it can't race another idle
+        // machine doing the same thing. It must let go afterwards, or a later Play would
+        // be wrongly blocked.
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+
+        await _engine.SyncNowAsync();
+
+        Assert.Equal("db2", _cloud.ContentOf(Prefix + "_main.1.db2"));
+        Assert.False(_cloud.Locks.ContainsKey(_world));
+        Assert.Equal(SyncStatus.InSync, _statuses.Last());
+    }
+
+    [Fact]
+    public async Task OpportunisticUpload_BacksOffIfAnotherMachineGrabsTheLockMidRace()
+    {
+        if (GameIsRunning) return;
+        // Two idle clients can both observe "no one holds the lock" via GetLockAsync at
+        // the same moment and both decide to upload. Simulate the race: right as this
+        // engine calls TryAcquireLockAsync, another machine's lock appears underneath it.
+        // Before the fix, the engine uploaded unconditionally here regardless of the
+        // lock, so the two clients' uploads/stale-file cleanups could interleave and
+        // corrupt the remote set (a torn marker). Now it must back off untouched.
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+        SeedRemoteWorld(new Dictionary<string, string>
+        {
+            ["_main.9.db2"] = "othermachinedb2",
+            ["_main.9.fwl2"] = "othermachinefwl2",
+            ["_main.9.chunks"] = "otheridx",
+            ["_main.9.ok"] = "1",
+        }, DateTimeOffset.UtcNow.AddMinutes(-10)); // older than local, so this client would otherwise upload
+        _cloud.OnTryAcquireLock = () => _cloud.Locks[_world] = new WorldLock("Bob", DateTimeOffset.UtcNow);
+
+        await _engine.SyncNowAsync();
+
+        // The other machine's just-uploaded revision must survive untouched.
+        Assert.Equal("othermachinedb2", _cloud.ContentOf(Prefix + "_main.9.db2"));
+        Assert.False(_cloud.Files.ContainsKey(Prefix + "_main.1.db2"));
+        Assert.Equal(SyncStatus.LockedByOther, _statuses.Last());
     }
 
     [Fact]

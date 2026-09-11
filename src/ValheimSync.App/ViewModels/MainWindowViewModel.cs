@@ -230,6 +230,9 @@ public partial class MainWindowViewModel : ObservableObject
         var serverNames = files
             .Where(f => f.Name.Contains('/'))
             .Select(f => f.Name[..f.Name.IndexOf('/')])
+            // "<world>.bak" is the rolling remote backup prefix (see SyncEngine.BackupRemoteAsync)
+            // — it groups under '/' just like a real world, but it's not one; never list it.
+            .Where(n => !n.EndsWith(".bak", StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
             .ToList();
