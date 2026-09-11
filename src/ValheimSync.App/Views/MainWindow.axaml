@@ -3,7 +3,7 @@
         xmlns:vm="using:ValheimSync.App.ViewModels"
         x:Class="ValheimSync.App.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
-        Title="VSaver — shared world sync"
+        Title="{Binding WindowTitle}"
         Icon="/app.ico"
         Width="760" Height="560"
         MinWidth="600" MinHeight="440">

@@ -6,11 +6,15 @@ using ValheimSync.Core;
 using ValheimSync.Core.Models;
 using ValheimSync.Core.Storage;
 using ValheimSync.Core.Sync;
+using ValheimSync.Core.Update;
 
 namespace ValheimSync.App.ViewModels;
 
 public partial class MainWindowViewModel : ObservableObject
 {
+    /// <summary>Window title, including the running version — e.g. "VSaver v2.0.1".</summary>
+    public string WindowTitle => $"VSaver v{Updater.CurrentVersion.ToString(3)}";
+
     private readonly AppSettings _settings;
     private SyncEngine? _engine;
     private ICloudStorageProvider? _cloud;
