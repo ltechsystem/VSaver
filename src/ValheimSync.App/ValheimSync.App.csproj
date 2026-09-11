@@ -15,7 +15,7 @@
     <!-- Bump this for every release. The tag on the GitHub Release must match (e.g. v1.0.1).
          The running build compares its version against the latest release to decide whether
          to auto-update. -->
-    <Version>2.0.0</Version>
+    <Version>2.0.1</Version>
   </PropertyGroup>
 
   <ItemGroup>
