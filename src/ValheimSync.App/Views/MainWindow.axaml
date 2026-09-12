@@ -130,8 +130,39 @@
                                            VerticalAlignment="Center" FontWeight="SemiBold" Margin="0,0,12,0"/>
                                 <TextBlock Grid.Column="2" Text="{Binding SizeDisplay}"
                                            VerticalAlignment="Center" Opacity="0.7" Margin="0,0,12,0"/>
-                                <TextBlock Grid.Column="3" Text="{Binding StatusDisplay}"
-                                           VerticalAlignment="Center" Margin="0,0,12,0"/>
+                                <Panel Grid.Column="3" Margin="0,0,12,0" VerticalAlignment="Center">
+                                    <TextBlock Text="{Binding StatusDisplay}"
+                                               IsVisible="{Binding !IsTransferring}"/>
+                                    <!-- In-progress transfer: a circular badge that fills from
+                                         empty to full as Progress goes 0→1 (bottom-up, via a
+                                         clipped foreground circle over a muted track) instead of
+                                         plain "Syncing..." text — blue while uploading, green
+                                         while downloading. -->
+                                    <Panel Width="18" Height="18" IsVisible="{Binding IsUploading}"
+                                           ToolTip.Tip="Uploading...">
+                                        <Ellipse Width="18" Height="18" Fill="#12324A"/>
+                                        <Ellipse Width="18" Height="18" Fill="#1E88E5">
+                                            <Ellipse.Clip>
+                                                <RectangleGeometry Rect="{Binding ProgressClipRect}"/>
+                                            </Ellipse.Clip>
+                                        </Ellipse>
+                                        <TextBlock Text="↑" Foreground="White" FontWeight="Bold" FontSize="12"
+                                                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                   IsHitTestVisible="False"/>
+                                    </Panel>
+                                    <Panel Width="18" Height="18" IsVisible="{Binding IsDownloading}"
+                                           ToolTip.Tip="Downloading...">
+                                        <Ellipse Width="18" Height="18" Fill="#1B3B22"/>
+                                        <Ellipse Width="18" Height="18" Fill="#43A047">
+                                            <Ellipse.Clip>
+                                                <RectangleGeometry Rect="{Binding ProgressClipRect}"/>
+                                            </Ellipse.Clip>
+                                        </Ellipse>
+                                        <TextBlock Text="↓" Foreground="White" FontWeight="Bold" FontSize="12"
+                                                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                   IsHitTestVisible="False"/>
+                                    </Panel>
+                                </Panel>
                                 <TextBlock Grid.Column="4" Text="{Binding LockDisplay}"
                                            VerticalAlignment="Center" Opacity="0.8" Margin="0,0,12,0"/>
                                 <Button    Grid.Column="5" Content="Play" Margin="0,0,12,0"

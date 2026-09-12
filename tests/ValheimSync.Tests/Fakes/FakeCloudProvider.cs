@@ -69,7 +69,9 @@ internal sealed class FakeCloudProvider : ICloudStorageProvider
         IProgress<double>? progress = null, CancellationToken ct = default)
     {
         var bytes = await File.ReadAllBytesAsync(localPath, ct);
+        progress?.Report(0.5); // a real provider reports incrementally; fake it with one midpoint tick
         Files[remoteName] = (bytes, DateTimeOffset.UtcNow);
+        progress?.Report(1.0);
         Calls.Add($"upload:{remoteName}");
     }
 
@@ -80,8 +82,10 @@ internal sealed class FakeCloudProvider : ICloudStorageProvider
             await Task.Delay(Timeout.Infinite, ct); // stalled "network call" — only ct ends this
         if (!Files.TryGetValue(remoteName, out var f))
             throw new FileNotFoundException($"'{remoteName}' not found in fake cloud.");
+        progress?.Report(0.5); // a real provider reports incrementally; fake it with one midpoint tick
         var bytes = CorruptDownloads ? Encoding.UTF8.GetBytes("corrupted!!") : f.Content;
         await File.WriteAllBytesAsync(localPath, bytes, ct);
+        progress?.Report(1.0);
         Calls.Add($"download:{remoteName}");
     }
 
