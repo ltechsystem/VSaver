@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using ValheimSync.Core.Models;
 using ValheimSync.Core.Storage;
+using ValheimSync.Core.Update;
 using ValheimSync.Core.Util;
 
 namespace ValheimSync.Core.Sync;
@@ -11,10 +12,10 @@ namespace ValheimSync.Core.Sync;
 ///
 ///   * FileSystemWatcher (debounced) → upload after Valheim finishes a save
 ///   * Periodic poll (default 15 min) → download remote changes / fallback upload check
+///   * A world's whole file set is packed into one deterministic zip archive
+///     (see <see cref="WorldZip"/>) and transferred as a single "&lt;world&gt;.zip" —
+///     one Drive object, one MD5, one API call each way instead of one per file
 ///   * MD5 comparison against Drive's md5Checksum → no duplicate transfers, ever
-///   * A world's "manifest.commit" marker is uploaded LAST and certifies that the whole
-///     file set currently under its "&lt;world&gt;/" prefix was uploaded together
-///     (see CommitMarker)
 ///   * Downloads go to a temp file, are hash-verified, then moved atomically
 ///   * Nothing is downloaded while Valheim is running
 ///
@@ -125,21 +126,76 @@ public sealed class SyncEngine : IAsyncDisposable
         {
             // The linked token fired from CancelAfter, not from the caller — a stalled
             // transfer, not a real shutdown/cancellation.
+            var timeoutEx = new TimeoutException(
+                $"Sync timed out after {_syncTimeout.TotalMinutes:F0} minutes (a file transfer likely stalled).");
             _log.LogError("Sync timed out for {World}", worldName);
             Info($"[{worldName}] Sync timed out after {_syncTimeout.TotalMinutes:F0} minutes " +
                  "(a file transfer likely stalled) — will retry on the next sync.");
             WorldStatusChanged?.Invoke(worldName, SyncStatus.Error);
+            await TryUploadErrorLogAsync(worldName, timeoutEx, ct);
         }
         catch (Exception ex)
         {
             _log.LogError(ex, "Sync failed for {World}", worldName);
             Info($"[{worldName}] Sync failed: {ex.Message}");
             WorldStatusChanged?.Invoke(worldName, SyncStatus.Error);
+            await TryUploadErrorLogAsync(worldName, ex, ct);
         }
         finally
         {
             _syncGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Best-effort: writes a detailed .txt report of a sync failure (a stalled transfer, a
+    /// corrupt/incomplete download, any other exception) and uploads it to the shared Drive
+    /// folder so it's diagnosable from any machine, not just this one's local log. Never
+    /// throws, and never fires for a real shutdown/cancellation — only for genuine failures.
+    /// </summary>
+    private async Task TryUploadErrorLogAsync(string worldName, Exception ex, CancellationToken ct)
+    {
+        if (ex is OperationCanceledException || ct.IsCancellationRequested) return;
+
+        string? tmp = null;
+        try
+        {
+            var content =
+                $"""
+                ValheimSync error log
+                Time (UTC):   {DateTime.UtcNow:O}
+                Player:       {_settings.PlayerName}
+                World:        {worldName}
+                Provider:     {_cloud.ProviderName}
+                App version:  {Updater.CurrentVersion}
+
+                {ex}
+                """;
+
+            tmp = Path.Combine(Path.GetTempPath(), $"vs-errorlog-{Guid.NewGuid():N}.txt");
+            await File.WriteAllTextAsync(tmp, content, ct);
+
+            var remoteName = $"errorlog_{SanitizeForFileName(worldName)}_" +
+                $"{SanitizeForFileName(_settings.PlayerName)}_{DateTime.UtcNow:yyyyMMdd_HHmmssZ}.txt";
+            await _cloud.UploadAsync(tmp, remoteName, null, ct);
+            Info($"[{worldName}] Uploaded a detailed error log ({remoteName}) to the shared folder.");
+        }
+        catch (Exception uploadEx)
+        {
+            // Never let a failed log upload mask the original error, or throw out of a
+            // catch block.
+            _log.LogWarning(uploadEx, "Couldn't upload error log for {World}", worldName);
+        }
+        finally
+        {
+            if (tmp is not null && File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    private static string SanitizeForFileName(string name)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        return new string(name.Select(c => invalid.Contains(c) || c == '/' ? '_' : c).ToArray());
     }
 
     private async Task SyncWorldAsync(string worldName, CancellationToken ct,
@@ -149,9 +205,8 @@ public sealed class SyncEngine : IAsyncDisposable
             .FirstOrDefault(w => string.Equals(w.Name, worldName, StringComparison.OrdinalIgnoreCase));
 
         var remote = await _cloud.ListFilesAsync(ct);
-        var remoteFiles = RemoteWorldFiles(remote, worldName);
-        var remoteManifest = remote.FirstOrDefault(f =>
-            f.Name.Equals(CommitMarker.Name(worldName), StringComparison.OrdinalIgnoreCase));
+        var remoteZip = remote.FirstOrDefault(f =>
+            f.Name.Equals(WorldArchive.ZipName(worldName), StringComparison.OrdinalIgnoreCase));
 
         var whoHasLock = await _cloud.GetLockAsync(worldName, ct);
         bool iHoldLock = whoHasLock is not null &&
@@ -159,16 +214,9 @@ public sealed class SyncEngine : IAsyncDisposable
         bool otherHoldsLock = whoHasLock is not null && !whoHasLock.IsStale && !iHoldLock;
 
         // ---- Case 1: nothing local, remote exists → first-time download ----
-        if (local is null && remoteFiles.Count > 0)
+        if (local is null && remoteZip is not null)
         {
-            if (!CommitState(remoteFiles, remoteManifest))
-            {
-                Info($"[{worldName}] Remote save looks torn (an upload was interrupted) — " +
-                     "waiting for the next complete upload before downloading.");
-                WorldStatusChanged?.Invoke(worldName, SyncStatus.Error);
-                return;
-            }
-            await DownloadWorldAsync(worldName, remoteFiles, ct);
+            await DownloadWorldAsync(worldName, remoteZip, ct);
             return;
         }
 
@@ -178,96 +226,94 @@ public sealed class SyncEngine : IAsyncDisposable
             return;
         }
 
-        // ---- Compare: does the local file set exactly match what's remote? ----
-        var localHashes = await HashLocalManifestAsync(worldName, local, ct);
-        bool setMatches = FileSetMatches(localHashes, remoteFiles);
-
-        if (setMatches)
+        // Pack the local save once per sync pass — used both for the MD5 comparison
+        // below and, if this pass ends up uploading, as the exact bytes sent.
+        var localZipPath = Path.Combine(Path.GetTempPath(), $"vs-{Guid.NewGuid():N}.zip");
+        try
         {
-            // A matching set has nothing partial left to complete — the only repairable
-            // defect is a missing/stale manifest marker.
-            if (!otherHoldsLock)
-            {
-                try { await RepairRemoteManifestAsync(worldName, localHashes, remoteFiles, remoteManifest, ct); }
-                catch (Exception ex) { Info($"[{worldName}] Couldn't repair remote manifest: {ex.Message}"); }
-            }
-            WorldStatusChanged?.Invoke(worldName, otherHoldsLock ? SyncStatus.LockedByOther : SyncStatus.InSync);
-            return;
-        }
+            await WorldZip.CreateAsync(local.AllFilePaths, localZipPath, ct);
+            var localMd5 = await Hashing.Md5Async(localZipPath, ct);
 
-        // ---- Divergence: decide direction ----
-        // If I hold the lock (or no one does and my file is newer), upload.
-        // If someone else holds the lock, or the remote is newer, download —
-        // but never while Valheim is running locally.
-        bool remoteIsNewer = remoteFiles.Count > 0 &&
-            remoteFiles.Max(f => f.ModifiedTime.UtcDateTime) > local.LastWriteUtc;
+            // ---- Compare: does the local save exactly match what's remote? ----
+            bool setMatches = remoteZip is not null &&
+                string.Equals(remoteZip.Md5Checksum, localMd5, StringComparison.OrdinalIgnoreCase);
 
-        if (iHoldLock || remoteFiles.Count == 0 || (!otherHoldsLock && !remoteIsNewer))
-        {
-            if (ValheimProcess.IsRunning())
+            if (setMatches)
             {
-                // Only push mid-session when the in-game timer asked us to AND the save
-                // has been quiet long enough that Valheim isn't part-way through writing it.
-                var settled = (DateTime.UtcNow - local.LastWriteUtc)
-                    >= TimeSpan.FromSeconds(_settings.DebounceSeconds);
-                if (!allowUploadWhileRunning || !settled)
-                {
-                    Info($"[{worldName}] Valheim is running — will upload after the next completed save.");
-                    return;
-                }
-                Info($"[{worldName}] Valheim running — pushing in-progress save.");
-            }
-
-            // If I don't already hold the lock (this is an opportunistic background
-            // upload — "no one holds the lock and my file isn't older" — rather than an
-            // active play session), grab it for the duration of the upload. Without this,
-            // two idle clients that both satisfy that condition at the same moment can
-            // race: their per-file uploads and stale-file cleanup interleave on the same
-            // "<world>/" prefix and corrupt the set, leaving a remote whose files don't
-            // hash to the marker (torn). Whoever loses the race sees the lock on its next
-            // pass and correctly downloads/skips instead of stepping on the winner.
-            bool tookLock = false;
-            if (!iHoldLock)
-            {
-                tookLock = await _cloud.TryAcquireLockAsync(worldName, _settings.PlayerName, ct);
-                if (!tookLock)
-                {
-                    Info($"[{worldName}] Another machine grabbed the lock just now — skipping this upload.");
-                    WorldStatusChanged?.Invoke(worldName, SyncStatus.LockedByOther);
-                    return;
-                }
-            }
-            try
-            {
-                await UploadWorldAsync(worldName, local, localHashes, remote, ct);
-            }
-            finally
-            {
-                if (tookLock)
-                    await _cloud.ReleaseLockAsync(worldName, _settings.PlayerName, ct);
-            }
-        }
-        else
-        {
-            if (ValheimProcess.IsRunning())
-            {
-                Info($"[{worldName}] Remote is newer but Valheim is running — skipping download.");
-                WorldStatusChanged?.Invoke(worldName, SyncStatus.RemoteNewer);
+                WorldStatusChanged?.Invoke(worldName, otherHoldsLock ? SyncStatus.LockedByOther : SyncStatus.InSync);
                 return;
             }
-            if (!CommitState(remoteFiles, remoteManifest))
+
+            // ---- Divergence: decide direction ----
+            // If I hold the lock (or no one does and my file is newer), upload.
+            // If someone else holds the lock, or the remote is newer, download —
+            // but never while Valheim is running locally.
+            bool remoteIsNewer = remoteZip is not null &&
+                remoteZip.ModifiedTime.UtcDateTime > local.LastWriteUtc;
+
+            if (iHoldLock || remoteZip is null || (!otherHoldsLock && !remoteIsNewer))
             {
-                Info($"[{worldName}] Remote save is incomplete or torn — skipping download " +
-                     "until it's re-uploaded.");
-                WorldStatusChanged?.Invoke(worldName, SyncStatus.Error);
-                return;
+                if (ValheimProcess.IsRunning())
+                {
+                    // Only push mid-session when the in-game timer asked us to AND the save
+                    // has been quiet long enough that Valheim isn't part-way through writing it.
+                    var settled = (DateTime.UtcNow - local.LastWriteUtc)
+                        >= TimeSpan.FromSeconds(_settings.DebounceSeconds);
+                    if (!allowUploadWhileRunning || !settled)
+                    {
+                        Info($"[{worldName}] Valheim is running — will upload after the next completed save.");
+                        return;
+                    }
+                    Info($"[{worldName}] Valheim running — pushing in-progress save.");
+                }
+
+                // If I don't already hold the lock (this is an opportunistic background
+                // upload — "no one holds the lock and my file isn't older" — rather than an
+                // active play session), grab it for the duration of the upload. Without this,
+                // two idle clients that both satisfy that condition at the same moment can
+                // race and overwrite each other's upload. Whoever loses the race sees the
+                // lock on its next pass and correctly downloads/skips instead of stepping on
+                // the winner.
+                bool tookLock = false;
+                if (!iHoldLock)
+                {
+                    tookLock = await _cloud.TryAcquireLockAsync(worldName, _settings.PlayerName, ct);
+                    if (!tookLock)
+                    {
+                        Info($"[{worldName}] Another machine grabbed the lock just now — skipping this upload.");
+                        WorldStatusChanged?.Invoke(worldName, SyncStatus.LockedByOther);
+                        return;
+                    }
+                }
+                try
+                {
+                    await UploadWorldAsync(worldName, local, localZipPath, ct);
+                }
+                finally
+                {
+                    if (tookLock)
+                        await _cloud.ReleaseLockAsync(worldName, _settings.PlayerName, ct);
+                }
             }
-            await DownloadWorldAsync(worldName, remoteFiles, ct);
+            else
+            {
+                if (ValheimProcess.IsRunning())
+                {
+                    Info($"[{worldName}] Remote is newer but Valheim is running — skipping download.");
+                    WorldStatusChanged?.Invoke(worldName, SyncStatus.RemoteNewer);
+                    return;
+                }
+                await DownloadWorldAsync(worldName, remoteZip!, ct);
+            }
+        }
+        finally
+        {
+            if (File.Exists(localZipPath)) File.Delete(localZipPath);
         }
     }
 
-    private async Task UploadWorldAsync(string worldName, WorldSave local,
-        IReadOnlyDictionary<string, string> localHashes, IReadOnlyList<RemoteFile> remote, CancellationToken ct)
+    private async Task UploadWorldAsync(string worldName, WorldSave local, string localZipPath,
+        CancellationToken ct)
     {
         WorldStatusChanged?.Invoke(worldName, SyncStatus.Syncing);
 
@@ -278,41 +324,12 @@ public sealed class SyncEngine : IAsyncDisposable
         // The set is persisted so an app restart mid-session can't retrigger it.
         if (_session.BackedUpWorlds.Add(worldName))
         {
-            await BackupRemoteAsync(worldName, remote, ct);
+            await BackupRemoteAsync(worldName, ct);
             _session.Save(_sessionStatePath);
         }
 
         Info($"[{worldName}] Uploading ({local.SizeBytes / (1024.0 * 1024):F1} MB)...");
-
-        // Skip any file whose remote copy already matches by MD5 — untouched chunk files
-        // (the common case: most zones don't change between saves) cost nothing here.
-        var remoteByName = remote.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
-        foreach (var path in local.AllFilePaths)
-        {
-            var remoteName = RemoteName(worldName, path);
-            if (remoteByName.TryGetValue(remoteName, out var existing) &&
-                string.Equals(existing.Md5Checksum, localHashes[remoteName], StringComparison.OrdinalIgnoreCase))
-                continue;
-            await _cloud.UploadAsync(path, remoteName, null, ct);
-        }
-
-        // Drop any remote file under this world's prefix that isn't part of the current
-        // revision any more (a superseded chunk, or the previous revision's main files) —
-        // otherwise a stale leftover could be mistaken for part of a future revision.
-        var currentNames = localHashes.Keys;
-        var prefix = CommitMarker.RemotePrefix(worldName);
-        var markerName = CommitMarker.Name(worldName);
-        foreach (var f in remote.Where(f =>
-                     f.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
-                     !f.Name.Equals(markerName, StringComparison.OrdinalIgnoreCase) &&
-                     !currentNames.Contains(f.Name)))
-            await _cloud.DeleteAsync(f.Name, ct);
-
-        // The manifest marker is uploaded LAST. Only a marker whose content matches every
-        // file's MD5 certifies the set as uploaded together, so an interrupt anywhere
-        // before the marker leaves the remote detectably torn instead of silently
-        // downloadable.
-        await UploadCommitMarkerAsync(worldName, localHashes, ct);
+        await _cloud.UploadAsync(localZipPath, WorldArchive.ZipName(worldName), null, ct);
 
         Info($"[{worldName}] Upload complete.");
         WorldStatusChanged?.Invoke(worldName, SyncStatus.InSync);
@@ -335,35 +352,17 @@ public sealed class SyncEngine : IAsyncDisposable
     }
 
     /// <summary>
-    /// Server-side-copies the world's whole current "&lt;world&gt;/" prefix to a
-    /// "&lt;world&gt;.bak/" prefix before it's overwritten, then removes any leftover
-    /// .bak file that isn't part of this backup (a previous revision may have had a
-    /// different set of chunk files). Best-effort: a failed backup is logged but never
-    /// blocks the upload that follows.
+    /// Server-side-copies the world's current "&lt;world&gt;.zip" to "&lt;world&gt;.zip.bak"
+    /// before it's overwritten, keeping exactly one rolling backup. Best-effort: a failed
+    /// backup is logged but never blocks the upload that follows.
     /// </summary>
-    private async Task BackupRemoteAsync(string worldName, IReadOnlyList<RemoteFile> remote, CancellationToken ct)
+    private async Task BackupRemoteAsync(string worldName, CancellationToken ct)
     {
         try
         {
-            var prefix = CommitMarker.RemotePrefix(worldName);
-            var backupPrefix = worldName + ".bak/";
-            var toBackup = remote.Where(f => f.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToList();
-
-            var newBackupNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var any = false;
-            foreach (var f in toBackup)
-            {
-                var dest = backupPrefix + f.Name[prefix.Length..];
-                newBackupNames.Add(dest);
-                if (await _cloud.CopyAsync(f.Name, dest, ct)) any = true;
-            }
-
-            foreach (var f in remote.Where(f =>
-                         f.Name.StartsWith(backupPrefix, StringComparison.OrdinalIgnoreCase) &&
-                         !newBackupNames.Contains(f.Name)))
-                await _cloud.DeleteAsync(f.Name, ct);
-
-            if (any) Info($"[{worldName}] Backed up previous remote save.");
+            var copied = await _cloud.CopyAsync(
+                WorldArchive.ZipName(worldName), WorldArchive.BackupZipName(worldName), ct);
+            if (copied) Info($"[{worldName}] Backed up previous remote save.");
         }
         catch (Exception ex)
         {
@@ -371,50 +370,7 @@ public sealed class SyncEngine : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Consistency of a world's remote file set against its manifest marker, judged
-    /// purely from the folder listing — the marker's canonical content makes its MD5
-    /// predictable from every file's MD5, so no download is needed. There is no legacy/
-    /// pre-marker era for this format, so a file set with no marker (or a stale one) is
-    /// always torn.
-    /// </summary>
-    private static bool CommitState(IReadOnlyList<RemoteFile> remoteFiles, RemoteFile? manifest)
-    {
-        if (remoteFiles.Count == 0) return true;
-        if (manifest?.Md5Checksum is null) return false;
-        if (remoteFiles.Any(f => f.Md5Checksum is null)) return false;
-        var expected = Hashing.Md5Text(
-            CommitMarker.Content(remoteFiles.Select(f => (f.Name, f.Md5Checksum!))));
-        return string.Equals(manifest.Md5Checksum, expected, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private async Task UploadCommitMarkerAsync(string worldName,
-        IReadOnlyDictionary<string, string> fileHashes, CancellationToken ct)
-    {
-        var tmp = Path.Combine(Path.GetTempPath(), $"vs-{Guid.NewGuid():N}.manifest");
-        var content = CommitMarker.Content(fileHashes.Select(kv => (kv.Key, kv.Value)));
-        await File.WriteAllTextAsync(tmp, content, ct);
-        try { await _cloud.UploadAsync(tmp, CommitMarker.Name(worldName), null, ct); }
-        finally { File.Delete(tmp); }
-    }
-
-    /// <summary>
-    /// Runs when the local and remote file sets already match exactly: writes/refreshes
-    /// the manifest marker when it's missing or stale (its own upload failed after the
-    /// rest of the set went up). Safe for any client — it only describes content that
-    /// already matches what it has locally.
-    /// </summary>
-    private async Task RepairRemoteManifestAsync(string worldName,
-        IReadOnlyDictionary<string, string> localHashes, IReadOnlyList<RemoteFile> remoteFiles,
-        RemoteFile? manifest, CancellationToken ct)
-    {
-        if (CommitState(remoteFiles, manifest)) return;
-        await UploadCommitMarkerAsync(worldName, localHashes, ct);
-        Info($"[{worldName}] Wrote manifest marker for the remote save.");
-    }
-
-    private async Task DownloadWorldAsync(string worldName, IReadOnlyList<RemoteFile> remoteFiles,
-        CancellationToken ct)
+    private async Task DownloadWorldAsync(string worldName, RemoteFile remoteZip, CancellationToken ct)
     {
         WorldStatusChanged?.Invoke(worldName, SyncStatus.Syncing);
         Info($"[{worldName}] Downloading...");
@@ -422,34 +378,25 @@ public sealed class SyncEngine : IAsyncDisposable
         Directory.CreateDirectory(_settings.WorldsPath);
         var worldDir = Path.Combine(_settings.WorldsPath, worldName);
 
-        var prefix = CommitMarker.RemotePrefix(worldName);
+        var tmpZip = Path.Combine(Path.GetTempPath(), $"vs-{Guid.NewGuid():N}.zip");
         var tmpDir = Path.Combine(Path.GetTempPath(), $"{worldName}-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tmpDir);
         try
         {
-            var downloaded = new List<(string RemoteName, string TmpPath)>();
-            foreach (var f in remoteFiles)
-            {
-                var tmpPath = Path.Combine(tmpDir, f.Name[prefix.Length..]);
-                await _cloud.DownloadAsync(f.Name, tmpPath, null, ct);
-                downloaded.Add((f.Name, tmpPath));
-            }
+            await _cloud.DownloadAsync(remoteZip.Name, tmpZip, null, ct);
 
-            // Verify every file against the listing's hash before touching the live folder.
-            var byName = remoteFiles.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
-            foreach (var (remoteName, tmpPath) in downloaded)
-            {
-                var expected = byName[remoteName].Md5Checksum;
-                if (expected is not null && expected != await Hashing.Md5Async(tmpPath, ct))
-                    throw new IOException($"Downloaded '{remoteName}' failed hash verification — aborting.");
-            }
+            // Verify the archive against the listing's hash before touching the live folder.
+            if (remoteZip.Md5Checksum is not null &&
+                remoteZip.Md5Checksum != await Hashing.Md5Async(tmpZip, ct))
+                throw new IOException($"Downloaded '{remoteZip.Name}' failed hash verification — aborting.");
+
+            await WorldZip.ExtractAsync(tmpZip, tmpDir, ct);
 
             // Swap the whole folder: keep one safety copy of what we're replacing, then
             // replace it entirely with exactly the new revision's files. A full swap
             // (rather than overwriting file-by-file) is what prunes the previous
-            // revision's main files and any now-superseded chunks — the same end state
-            // Valheim's own save leaves. Nothing touches the live folder until every
-            // download above has verified — a failed/corrupt download leaves it as-is.
+            // revision's main files and any now-superseded chunks locally too — the same
+            // end state Valheim's own save leaves. Nothing touches the live folder until
+            // the download above has verified — a failed/corrupt download leaves it as-is.
             if (Directory.Exists(worldDir) && Directory.EnumerateFileSystemEntries(worldDir).Any())
             {
                 var backupDir = worldDir + ".synbak";
@@ -458,8 +405,11 @@ public sealed class SyncEngine : IAsyncDisposable
             }
             Directory.CreateDirectory(worldDir);
 
-            foreach (var (remoteName, tmpPath) in downloaded)
-                File.Move(tmpPath, Path.Combine(worldDir, remoteName[prefix.Length..]), overwrite: true);
+            // File-by-file (not a directory move) because the temp folder and the worlds
+            // path can live on different volumes — File.Move falls back to copy+delete
+            // across volumes, Directory.Move does not.
+            foreach (var file in Directory.EnumerateFiles(tmpDir))
+                File.Move(file, Path.Combine(worldDir, Path.GetFileName(file)), overwrite: true);
 
             // Also drop it into Valheim's LocalLow folder so it actually shows up in the
             // in-game world list (see MirrorToLocalLow). Never fatal to the download.
@@ -470,6 +420,7 @@ public sealed class SyncEngine : IAsyncDisposable
         }
         finally
         {
+            if (File.Exists(tmpZip)) File.Delete(tmpZip);
             if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true);
         }
     }
@@ -528,39 +479,6 @@ public sealed class SyncEngine : IAsyncDisposable
 
         Directory.CreateDirectory(folder);
         return folder;
-    }
-
-    private static List<RemoteFile> RemoteWorldFiles(IReadOnlyList<RemoteFile> remote, string worldName)
-    {
-        var prefix = CommitMarker.RemotePrefix(worldName);
-        var markerName = CommitMarker.Name(worldName);
-        return remote.Where(f => f.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
-                                  !f.Name.Equals(markerName, StringComparison.OrdinalIgnoreCase))
-            .ToList();
-    }
-
-    private static async Task<Dictionary<string, string>> HashLocalManifestAsync(
-        string worldName, WorldSave local, CancellationToken ct)
-    {
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var path in local.AllFilePaths)
-            result[RemoteName(worldName, path)] = await Hashing.Md5Async(path, ct);
-        return result;
-    }
-
-    private static string RemoteName(string worldName, string localPath) =>
-        CommitMarker.RemotePrefix(worldName) + Path.GetFileName(localPath);
-
-    private static bool FileSetMatches(IReadOnlyDictionary<string, string> localHashes,
-        IReadOnlyList<RemoteFile> remoteFiles)
-    {
-        if (remoteFiles.Count != localHashes.Count) return false;
-        foreach (var f in remoteFiles)
-        {
-            if (!localHashes.TryGetValue(f.Name, out var md5)) return false;
-            if (!string.Equals(f.Md5Checksum, md5, StringComparison.OrdinalIgnoreCase)) return false;
-        }
-        return true;
     }
 
     private void Info(string message)

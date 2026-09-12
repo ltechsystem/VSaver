@@ -12,7 +12,7 @@ ValheimSync/
 │   ├── ValheimSync.Core/          # No UI dependencies — all sync logic lives here
 │   │   ├── Models/                # WorldSave, RemoteFile, WorldLock, SyncStatus
 │   │   ├── Storage/               # ICloudStorageProvider + GoogleDriveStorageProvider
-│   │   ├── Sync/                  # WorldScanner, DebouncedWorldWatcher, SyncEngine
+│   │   ├── Sync/                  # WorldScanner, DebouncedWorldWatcher, WorldZip, SyncEngine
 │   │   └── Util/                  # MD5 hashing (matches Drive's md5Checksum)
 │   └── ValheimSync.App/           # Avalonia desktop app
 └── ValheimSync.sln
@@ -23,9 +23,9 @@ ValheimSync/
 ## How the sync works (30-second version)
 
 1. A `FileSystemWatcher` watches `worlds_local`, recursively (each world is its own subfolder). When Valheim writes a save, we wait until the files have been **quiet for 60 s** (debounce) before uploading — never a mid-write upload. Additionally, **while Valheim is open the current save is pushed every 5 minutes** (configurable via `InGameUploadMinutes`) as long as it actually changed and has settled — so a crash never loses more than that interval and friends can watch progress without waiting for you to quit.
-2. A **15-minute poll** (configurable) is the fallback and the download path: it compares every file's local MD5 against Drive's `md5Checksum`. Identical hash → nothing is transferred — including the terrain files Valheim didn't touch, since a world save is now many files (one per changed zone) rather than one giant file. **No duplicates, ever.**
-3. Every changed file uploads, then a tiny `manifest.commit` marker uploads last — it's the "commit marker" for the whole set, so a half-finished upload never looks like a valid world.
-4. Downloads go to a temp file, are hash-verified, a `.synbak` copy of your old world folder is kept, and only then is the new folder moved into place. Never while Valheim is running.
+2. A **15-minute poll** (configurable) is the fallback and the download path: it packs the world's whole file set into a single deterministic zip and compares its MD5 against Drive's `md5Checksum` for that world's `<World>.zip`. Identical hash → nothing is transferred. **No duplicates, ever.**
+3. Each upload/download moves the whole world as **one zip file** — one Drive API call each way instead of one per chunk file, which keeps things fast even on a connection with limited API headroom. The trade-off: unlike a per-file diff, changing even one small zone re-uploads the entire archive.
+4. Downloads go to a temp zip file, are hash-verified, unzipped, a `.synbak` copy of your old world folder is kept, and only then is the new folder moved into place. Never while Valheim is running.
 5. **Locking:** before playing, click **Play** — the app writes `<World>.lock` (your name + timestamp) to the Drive folder. Everyone else's app sees the lock and shows the world as in use. Click **Done** when you stop: it pushes your final save and releases the lock. Locks older than 12 h are treated as stale (crashed client). Note: Drive has no atomic compare-and-swap, so two people clicking Play in the same second could theoretically race — fine for a friend group, and the app re-checks after writing to shrink the window.
 
 > ⚠️ Valheim worlds cannot be merged. The lock exists because if two people play "their" copy simultaneously, whoever uploads last silently destroys the other's progress. Respect the lock. If you want *simultaneous* multiplayer, run a dedicated server instead — this tool is for "pass the world around" play.

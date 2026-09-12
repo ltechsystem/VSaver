@@ -228,15 +228,14 @@ public partial class MainWindowViewModel : ObservableObject
         if (_cloud is null) return;
 
         var files = await _cloud.ListFilesAsync();
-        // A server is any file under a "<world>/" prefix — a world's save is many files
-        // (see CommitMarker), and the "/" grouping is what makes its name recoverable
-        // even though no single file is literally named "<world>.something".
+        // A server is any file named "<world>.zip" (see WorldArchive) — the whole save
+        // travels as one archive, so its name is the world name directly. ".zip.bak" is
+        // the rolling remote backup (see SyncEngine.BackupRemoteAsync); it doesn't end in
+        // ".zip" so it's never mistaken for one.
+        const string zipSuffix = ".zip";
         var serverNames = files
-            .Where(f => f.Name.Contains('/'))
-            .Select(f => f.Name[..f.Name.IndexOf('/')])
-            // "<world>.bak" is the rolling remote backup prefix (see SyncEngine.BackupRemoteAsync)
-            // — it groups under '/' just like a real world, but it's not one; never list it.
-            .Where(n => !n.EndsWith(".bak", StringComparison.OrdinalIgnoreCase))
+            .Where(f => f.Name.EndsWith(zipSuffix, StringComparison.OrdinalIgnoreCase))
+            .Select(f => f.Name[..^zipSuffix.Length])
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -244,7 +243,8 @@ public partial class MainWindowViewModel : ObservableObject
         Worlds.Clear();
         foreach (var name in serverNames)
         {
-            var size = files.Where(f => f.Name.StartsWith($"{name}/", StringComparison.OrdinalIgnoreCase))
+            var size = files
+                .Where(f => f.Name.Equals(WorldArchive.ZipName(name), StringComparison.OrdinalIgnoreCase))
                 .Sum(f => f.SizeBytes);
 
             var item = new WorldItemViewModel(name, size) { IsSelected = true };

@@ -1,7 +1,6 @@
 using ValheimSync.Core;
 using ValheimSync.Core.Models;
 using ValheimSync.Core.Sync;
-using ValheimSync.Core.Util;
 using ValheimSync.Tests.Fakes;
 using Xunit;
 
@@ -15,6 +14,10 @@ namespace ValheimSync.Tests;
 ///    Valheim LocalLow folder (if this machine has one) can be cleaned up safely in Dispose.
 ///  - Tests early-return if Valheim is actually running on this machine, because the engine
 ///    deliberately refuses to transfer while the game is up (static ValheimProcess seam).
+///  - A world's whole save now travels as one deterministic zip (see WorldZip), so a
+///    "remote world" in these tests is built by zipping the same files SyncEngine would
+///    zip locally — see BuildZipBytesAsync/SeedRemoteWorldAsync — and inspected by
+///    unzipping it back (ExtractRemoteZipAsync) rather than reading a named file directly.
 /// </summary>
 public sealed class SyncEngineTests : IDisposable
 {
@@ -27,8 +30,8 @@ public sealed class SyncEngineTests : IDisposable
 
     private string WorldDir => Path.Combine(_dir, _world);
     private string SessionStatePath => Path.Combine(_dir, "sessionstate.json");
-    private string Prefix => _world + "/";
-    private string ManifestName => CommitMarker.Name(_world);
+    private string ZipName => WorldArchive.ZipName(_world);
+    private string BackupZipName => WorldArchive.BackupZipName(_world);
 
     public SyncEngineTests()
     {
@@ -62,19 +65,6 @@ public sealed class SyncEngineTests : IDisposable
             File.SetLastWriteTimeUtc(f, old);
     }
 
-    /// <summary>Seeds a complete, internally consistent remote world.</summary>
-    private void SeedRemoteWorld(IReadOnlyDictionary<string, string> files,
-        DateTimeOffset? modified = null, bool withMarker = true)
-    {
-        foreach (var (name, content) in files)
-            _cloud.Seed(Prefix + name, content, modified);
-        if (withMarker)
-        {
-            var entries = files.Select(kv => (Prefix + kv.Key, Hashing.Md5Text(kv.Value)));
-            _cloud.Seed(ManifestName, CommitMarker.Content(entries), modified);
-        }
-    }
-
     private static IReadOnlyDictionary<string, string> OneRevision(string db2 = "db2", string fwl2 = "fwl2") =>
         new Dictionary<string, string>
         {
@@ -85,13 +75,72 @@ public sealed class SyncEngineTests : IDisposable
             ["1e_1e__1_1.chunk"] = "chunkA",
         };
 
+    /// <summary>Builds the exact deterministic zip bytes WorldZip would build from these
+    /// files, so a seeded "remote" can be made to byte-for-byte match (or intentionally
+    /// differ from) a local save.</summary>
+    private static async Task<byte[]> BuildZipBytesAsync(IReadOnlyDictionary<string, string> files)
+    {
+        var srcDir = Path.Combine(Path.GetTempPath(), "vszip-src-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(srcDir);
+        try
+        {
+            var paths = new List<string>();
+            foreach (var (name, content) in files)
+            {
+                var path = Path.Combine(srcDir, name);
+                await File.WriteAllTextAsync(path, content);
+                paths.Add(path);
+            }
+            var zipPath = Path.Combine(Path.GetTempPath(), "vszip-" + Guid.NewGuid().ToString("N") + ".zip");
+            try
+            {
+                await WorldZip.CreateAsync(paths, zipPath);
+                return await File.ReadAllBytesAsync(zipPath);
+            }
+            finally { if (File.Exists(zipPath)) File.Delete(zipPath); }
+        }
+        finally { Directory.Delete(srcDir, recursive: true); }
+    }
+
+    private Task SeedRemoteWorldAsync(IReadOnlyDictionary<string, string> files, DateTimeOffset? modified = null) =>
+        SeedRemoteWorldAsync(_world, files, modified);
+
+    private async Task SeedRemoteWorldAsync(string world, IReadOnlyDictionary<string, string> files,
+        DateTimeOffset? modified = null)
+    {
+        var bytes = await BuildZipBytesAsync(files);
+        _cloud.SeedBytes(WorldArchive.ZipName(world), bytes, modified);
+    }
+
+    /// <summary>Unzips a seeded/uploaded remote archive back into a name→content map for
+    /// assertions.</summary>
+    private async Task<Dictionary<string, string>> ExtractRemoteZipAsync(string zipName)
+    {
+        var tmpZip = Path.Combine(Path.GetTempPath(), "vsx-" + Guid.NewGuid().ToString("N") + ".zip");
+        var tmpDir = Path.Combine(Path.GetTempPath(), "vsx-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            await File.WriteAllBytesAsync(tmpZip, _cloud.Files[zipName].Content);
+            await WorldZip.ExtractAsync(tmpZip, tmpDir);
+            var result = new Dictionary<string, string>();
+            foreach (var f in Directory.EnumerateFiles(tmpDir))
+                result[Path.GetFileName(f)] = await File.ReadAllTextAsync(f);
+            return result;
+        }
+        finally
+        {
+            if (File.Exists(tmpZip)) File.Delete(tmpZip);
+            if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
     // ---- download paths --------------------------------------------------
 
     [Fact]
     public async Task FirstTimeDownload_WhenLocalMissingAndRemoteComplete()
     {
         if (GameIsRunning) return;
-        SeedRemoteWorld(OneRevision());
+        await SeedRemoteWorldAsync(OneRevision());
 
         await _engine.SyncNowAsync();
 
@@ -106,9 +155,9 @@ public sealed class SyncEngineTests : IDisposable
         if (GameIsRunning) return;
         // A world whose download never returns (dead connection, huge first-time
         // transfer) must not hang this world's sync forever — since every world shares
-        // one sync gate, that would starve every other world behind it too. Verify it
-        // times out to Error instead, and that the gate is free again afterward.
-        SeedRemoteWorld(OneRevision());
+        // one sync gate, that would starve every other world's sync behind it too. Verify
+        // it times out to Error instead, and that the gate is free again afterward.
+        await SeedRemoteWorldAsync(OneRevision());
         _cloud.HangDownloads = true;
         await using var timeoutEngine = new SyncEngine(_settings, _cloud, null, SessionStatePath,
             syncTimeout: TimeSpan.FromMilliseconds(200));
@@ -124,10 +173,7 @@ public sealed class SyncEngineTests : IDisposable
         _cloud.HangDownloads = false;
         var secondWorld = "VSTestW2" + Guid.NewGuid().ToString("N")[..8];
         _settings.SelectedWorlds.Add(secondWorld);
-        foreach (var (name, content) in OneRevision())
-            _cloud.Seed($"{secondWorld}/{name}", content);
-        _cloud.Seed(CommitMarker.Name(secondWorld), CommitMarker.Content(
-            OneRevision().Select(kv => ($"{secondWorld}/{kv.Key}", Hashing.Md5Text(kv.Value)))));
+        await SeedRemoteWorldAsync(secondWorld, OneRevision());
 
         await timeoutEngine.SyncNowAsync();
 
@@ -147,64 +193,12 @@ public sealed class SyncEngineTests : IDisposable
     }
 
     [Fact]
-    public async Task TornRemote_MissingMarker_IsNotDownloaded()
-    {
-        if (GameIsRunning) return;
-        // There's no pre-marker era for this format — files with no marker at all are
-        // always an interrupted upload, never trusted.
-        SeedRemoteWorld(OneRevision(), withMarker: false);
-
-        await _engine.SyncNowAsync();
-
-        Assert.False(Directory.Exists(WorldDir));
-        Assert.Equal(SyncStatus.Error, _statuses.Last());
-        Assert.DoesNotContain(_cloud.Calls, c => c.StartsWith("download:"));
-    }
-
-    [Fact]
-    public async Task TornRemote_MarkerMismatch_IsNotDownloaded()
-    {
-        if (GameIsRunning) return;
-        var files = OneRevision();
-        foreach (var (name, content) in files) _cloud.Seed(Prefix + name, content);
-        // Marker describes a db2 that doesn't match what's actually up there.
-        _cloud.Seed(ManifestName, CommitMarker.Content(new[]
-        {
-            (Prefix + "_main.1.db2", Hashing.Md5Text("some-other-content")),
-            (Prefix + "_main.1.fwl2", Hashing.Md5Text(files["_main.1.fwl2"])),
-            (Prefix + "_main.1.chunks", Hashing.Md5Text(files["_main.1.chunks"])),
-            (Prefix + "_main.1.ok", Hashing.Md5Text(files["_main.1.ok"])),
-            (Prefix + "1e_1e__1_1.chunk", Hashing.Md5Text(files["1e_1e__1_1.chunk"])),
-        }));
-
-        await _engine.SyncNowAsync();
-
-        Assert.False(Directory.Exists(WorldDir));
-        Assert.Equal(SyncStatus.Error, _statuses.Last());
-    }
-
-    [Fact]
-    public async Task PartialRemoteFiles_WithNoMarker_IsTreatedAsTorn()
-    {
-        if (GameIsRunning) return;
-        // Any file under this world's prefix makes it a download candidate — and with no
-        // marker at all, that's unambiguously an interrupted upload.
-        _cloud.Seed(Prefix + "_main.1.db2", "halfuploaded");
-
-        await _engine.SyncNowAsync();
-
-        Assert.False(Directory.Exists(WorldDir));
-        Assert.Equal(SyncStatus.Error, _statuses.Last());
-        Assert.DoesNotContain(_cloud.Calls, c => c.StartsWith("download:"));
-    }
-
-    [Fact]
     public async Task Download_WhenOtherHoldsLock_AndKeepsSynbak()
     {
         if (GameIsRunning) return;
         WriteLocal(1, db2: "localdb2", chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "localChunk" });
         AgeLocalFiles();
-        SeedRemoteWorld(new Dictionary<string, string>
+        await SeedRemoteWorldAsync(new Dictionary<string, string>
         {
             ["_main.1.db2"] = "remotedb2",
             ["_main.1.fwl2"] = "remotefwl2",
@@ -222,44 +216,13 @@ public sealed class SyncEngineTests : IDisposable
     }
 
     [Fact]
-    public async Task TornRemote_BlocksDivergenceDownload_Too()
-    {
-        if (GameIsRunning) return;
-        WriteLocal(1, db2: "localdb2", chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "localChunk" });
-        AgeLocalFiles();
-        // Remote is newer but its marker certifies a different db2 — refuse to download.
-        var files = new Dictionary<string, string>
-        {
-            ["_main.1.db2"] = "remotedb2",
-            ["_main.1.fwl2"] = "remotefwl2",
-            ["_main.1.chunks"] = "remoteidx",
-            ["_main.1.ok"] = "1",
-            ["1e_1e__1_1.chunk"] = "remoteChunk",
-        };
-        foreach (var (name, content) in files) _cloud.Seed(Prefix + name, content);
-        _cloud.Seed(ManifestName, CommitMarker.Content(new[]
-        {
-            (Prefix + "_main.1.db2", Hashing.Md5Text("some-other-content")),
-            (Prefix + "_main.1.fwl2", Hashing.Md5Text(files["_main.1.fwl2"])),
-            (Prefix + "_main.1.chunks", Hashing.Md5Text(files["_main.1.chunks"])),
-            (Prefix + "_main.1.ok", Hashing.Md5Text(files["_main.1.ok"])),
-            (Prefix + "1e_1e__1_1.chunk", Hashing.Md5Text(files["1e_1e__1_1.chunk"])),
-        }));
-
-        await _engine.SyncNowAsync();
-
-        Assert.Equal("localdb2", File.ReadAllText(Path.Combine(WorldDir, "_main.1.db2"))); // untouched
-        Assert.Equal(SyncStatus.Error, _statuses.Last());
-    }
-
-    [Fact]
     public async Task Download_ReplacesWholeFolder_AndKeepsSynbak()
     {
         if (GameIsRunning) return;
         WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "localChunk" });
         AgeLocalFiles();
         // Remote is a newer revision with a different chunk filename (zone was edited).
-        SeedRemoteWorld(new Dictionary<string, string>
+        await SeedRemoteWorldAsync(new Dictionary<string, string>
         {
             ["_main.2.db2"] = "remoteDb2",
             ["_main.2.fwl2"] = "remoteFwl2",
@@ -283,7 +246,7 @@ public sealed class SyncEngineTests : IDisposable
     public async Task CorruptDownload_Aborts_LeavesLocalUntouched()
     {
         if (GameIsRunning) return;
-        SeedRemoteWorld(OneRevision());
+        await SeedRemoteWorldAsync(OneRevision());
         _cloud.CorruptDownloads = true;
 
         await _engine.SyncNowAsync();
@@ -292,20 +255,62 @@ public sealed class SyncEngineTests : IDisposable
         Assert.False(Directory.Exists(WorldDir));
     }
 
+    [Fact]
+    public async Task SyncFailure_UploadsDetailedErrorLog_ToTheSharedFolder()
+    {
+        if (GameIsRunning) return;
+        // A real failure (here: hash verification failing on a corrupted download) must
+        // leave a diagnosable trail in the shared Drive folder, not just this machine's
+        // local log — so anyone in the group can see what went wrong.
+        await SeedRemoteWorldAsync(OneRevision());
+        _cloud.CorruptDownloads = true;
+
+        await _engine.SyncNowAsync();
+
+        var errorLogName = _cloud.Files.Keys.SingleOrDefault(n =>
+            n.StartsWith("errorlog_", StringComparison.OrdinalIgnoreCase));
+        Assert.NotNull(errorLogName);
+        Assert.Contains($"errorlog_{_world}_me_", errorLogName, StringComparison.OrdinalIgnoreCase);
+
+        var content = _cloud.ContentOf(errorLogName!);
+        Assert.Contains(_world, content);
+        Assert.Contains("me", content); // player name
+        Assert.Contains("hash verification", content, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task StalledDownload_UploadsErrorLog_WithTimeoutDetails()
+    {
+        if (GameIsRunning) return;
+        await SeedRemoteWorldAsync(OneRevision());
+        _cloud.HangDownloads = true;
+        await using var timeoutEngine = new SyncEngine(_settings, _cloud, null, SessionStatePath,
+            syncTimeout: TimeSpan.FromMilliseconds(200));
+
+        await timeoutEngine.SyncNowAsync();
+
+        var errorLogName = _cloud.Files.Keys.SingleOrDefault(n =>
+            n.StartsWith("errorlog_", StringComparison.OrdinalIgnoreCase));
+        Assert.NotNull(errorLogName);
+        Assert.Contains("timed out", _cloud.ContentOf(errorLogName!), StringComparison.OrdinalIgnoreCase);
+    }
+
     // ---- upload paths ------------------------------------------------------
 
     [Fact]
-    public async Task Upload_WhenRemoteMissing_UploadsEveryFile_MarkerLast()
+    public async Task Upload_WhenRemoteMissing_UploadsWholeWorldAsOneZip()
     {
         if (GameIsRunning) return;
         WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("db2", _cloud.ContentOf(Prefix + "_main.1.db2"));
-        Assert.Equal("chunkA", _cloud.ContentOf(Prefix + "1e_1e__1_1.chunk"));
-        Assert.Equal(ManifestName, _cloud.Calls.Last().Split(':')[1]); // marker uploaded last
-        Assert.DoesNotContain(_cloud.Calls, c => c.StartsWith("copy:")); // nothing remote to back up yet
+        // The whole point of zipping: one Drive write moves the entire world, no matter
+        // how many local files make it up.
+        Assert.Equal(new[] { $"upload:{ZipName}" }, _cloud.Calls);
+        var remoteFiles = await ExtractRemoteZipAsync(ZipName);
+        Assert.Equal("db2", remoteFiles["_main.1.db2"]);
+        Assert.Equal("chunkA", remoteFiles["1e_1e__1_1.chunk"]);
         Assert.Equal(SyncStatus.InSync, _statuses.Last());
     }
 
@@ -315,7 +320,7 @@ public sealed class SyncEngineTests : IDisposable
         if (GameIsRunning) return;
         WriteLocal(1, db2: "mydb2", chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "myChunk" });
         AgeLocalFiles(); // remote looks newer by timestamp…
-        SeedRemoteWorld(new Dictionary<string, string>
+        await SeedRemoteWorldAsync(new Dictionary<string, string>
         {
             ["_main.1.db2"] = "remotedb2",
             ["_main.1.fwl2"] = "remotefwl2",
@@ -327,42 +332,38 @@ public sealed class SyncEngineTests : IDisposable
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("mydb2", _cloud.ContentOf(Prefix + "_main.1.db2"));
+        var remoteFiles = await ExtractRemoteZipAsync(ZipName);
+        Assert.Equal("mydb2", remoteFiles["_main.1.db2"]);
     }
 
     [Fact]
-    public async Task Upload_SkipsUnchangedChunks_ButUploadsChangedOnes()
+    public async Task Upload_TransfersWholeZip_EvenWhenOnlyOneChunkChanged()
     {
         if (GameIsRunning) return;
-        // Remote already has revision 1 with an untouched chunk; local has moved on to
-        // revision 2 where only that chunk's zone changed (new filename, new content) —
-        // the world's other file (a second, unmodified chunk) keeps its exact name.
-        SeedRemoteWorld(new Dictionary<string, string>
+        // Whole-world zipping trades the old per-chunk "skip unchanged" optimization for
+        // far fewer API calls: an upload always re-sends the entire archive — unchanged
+        // chunks included — in exactly one call.
+        await SeedRemoteWorldAsync(new Dictionary<string, string>
         {
             ["_main.1.db2"] = "db2v1",
             ["_main.1.fwl2"] = "fwl2v1",
             ["_main.1.chunks"] = "idxv1",
             ["_main.1.ok"] = "1",
             ["1e_1e__1_1.chunk"] = "unchanged",
-            ["20_20__1_1.chunk"] = "willChange",
         }, DateTimeOffset.UtcNow.AddDays(-1));
 
-        Directory.CreateDirectory(WorldDir);
-        File.WriteAllText(Path.Combine(WorldDir, "_main.2.db2"), "db2v2");
-        File.WriteAllText(Path.Combine(WorldDir, "_main.2.fwl2"), "fwl2v2");
-        File.WriteAllText(Path.Combine(WorldDir, "_main.2.chunks"), "idxv2");
-        File.WriteAllText(Path.Combine(WorldDir, "_main.2.ok"), "1");
-        File.WriteAllText(Path.Combine(WorldDir, "1e_1e__1_1.chunk"), "unchanged"); // same content, same name
-        File.WriteAllText(Path.Combine(WorldDir, "20_20__1_2.chunk"), "changed"); // new name+content
+        WriteLocal(2, db2: "db2v2", fwl2: "fwl2v2",
+            chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "unchanged" });
 
         await _engine.SyncNowAsync();
 
-        Assert.DoesNotContain(_cloud.Calls, c => c == $"upload:{Prefix}1e_1e__1_1.chunk");
-        Assert.Contains(_cloud.Calls, c => c == $"upload:{Prefix}20_20__1_2.chunk");
-        // Superseded revision-1 main files and the old chunk name are gone from the remote.
-        Assert.False(_cloud.Files.ContainsKey(Prefix + "_main.1.db2"));
-        Assert.False(_cloud.Files.ContainsKey(Prefix + "20_20__1_1.chunk"));
-        Assert.True(_cloud.Files.ContainsKey(Prefix + "1e_1e__1_1.chunk"));
+        // One backup copy (first upload of the session) plus exactly one upload call —
+        // still far fewer API calls than one per file.
+        Assert.Equal(new[] { $"copy:{ZipName}->{BackupZipName}", $"upload:{ZipName}" }, _cloud.Calls);
+        var remoteFiles = await ExtractRemoteZipAsync(ZipName);
+        Assert.Equal("unchanged", remoteFiles["1e_1e__1_1.chunk"]); // carried along despite not changing
+        Assert.Equal("db2v2", remoteFiles["_main.2.db2"]);
+        Assert.False(remoteFiles.ContainsKey("_main.1.db2")); // superseded revision is gone
     }
 
     [Fact]
@@ -378,7 +379,7 @@ public sealed class SyncEngineTests : IDisposable
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("db2", _cloud.ContentOf(Prefix + "_main.1.db2"));
+        Assert.True(_cloud.Files.ContainsKey(ZipName));
         Assert.False(_cloud.Locks.ContainsKey(_world));
         Assert.Equal(SyncStatus.InSync, _statuses.Last());
     }
@@ -390,11 +391,9 @@ public sealed class SyncEngineTests : IDisposable
         // Two idle clients can both observe "no one holds the lock" via GetLockAsync at
         // the same moment and both decide to upload. Simulate the race: right as this
         // engine calls TryAcquireLockAsync, another machine's lock appears underneath it.
-        // Before the fix, the engine uploaded unconditionally here regardless of the
-        // lock, so the two clients' uploads/stale-file cleanups could interleave and
-        // corrupt the remote set (a torn marker). Now it must back off untouched.
+        // It must back off untouched rather than overwrite the other machine's upload.
         WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
-        SeedRemoteWorld(new Dictionary<string, string>
+        await SeedRemoteWorldAsync(new Dictionary<string, string>
         {
             ["_main.9.db2"] = "othermachinedb2",
             ["_main.9.fwl2"] = "othermachinefwl2",
@@ -406,8 +405,8 @@ public sealed class SyncEngineTests : IDisposable
         await _engine.SyncNowAsync();
 
         // The other machine's just-uploaded revision must survive untouched.
-        Assert.Equal("othermachinedb2", _cloud.ContentOf(Prefix + "_main.9.db2"));
-        Assert.False(_cloud.Files.ContainsKey(Prefix + "_main.1.db2"));
+        var remoteFiles = await ExtractRemoteZipAsync(ZipName);
+        Assert.Equal("othermachinedb2", remoteFiles["_main.9.db2"]);
         Assert.Equal(SyncStatus.LockedByOther, _statuses.Last());
     }
 
@@ -416,7 +415,7 @@ public sealed class SyncEngineTests : IDisposable
     {
         if (GameIsRunning) return;
         WriteLocal(2, db2: "newdb2");
-        SeedRemoteWorld(new Dictionary<string, string>
+        await SeedRemoteWorldAsync(new Dictionary<string, string>
         {
             ["_main.1.db2"] = "olddb2",
             ["_main.1.fwl2"] = "oldfwl2",
@@ -426,8 +425,10 @@ public sealed class SyncEngineTests : IDisposable
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("olddb2", _cloud.ContentOf(_world + ".bak/_main.1.db2"));
-        Assert.Equal("newdb2", _cloud.ContentOf(Prefix + "_main.2.db2"));
+        var backupFiles = await ExtractRemoteZipAsync(BackupZipName);
+        Assert.Equal("olddb2", backupFiles["_main.1.db2"]);
+        var currentFiles = await ExtractRemoteZipAsync(ZipName);
+        Assert.Equal("newdb2", currentFiles["_main.2.db2"]);
         // Backup strictly precedes the overwrite.
         var backupIndex = _cloud.Calls.ToList().FindLastIndex(c => c.StartsWith("copy:"));
         var uploadIndex = _cloud.Calls.ToList().FindIndex(c => c.StartsWith("upload:"));
@@ -439,7 +440,7 @@ public sealed class SyncEngineTests : IDisposable
     {
         if (GameIsRunning) return;
         WriteLocal(2, db2: "v2");
-        SeedRemoteWorld(new Dictionary<string, string>
+        await SeedRemoteWorldAsync(new Dictionary<string, string>
         {
             ["_main.1.db2"] = "v1",
             ["_main.1.fwl2"] = "fwl1",
@@ -457,8 +458,10 @@ public sealed class SyncEngineTests : IDisposable
         File.SetLastWriteTimeUtc(db2Path, DateTime.UtcNow.AddSeconds(2));
         await _engine.SyncNowAsync();     // must NOT back up again
 
-        Assert.Equal("v3", _cloud.ContentOf(Prefix + "_main.2.db2"));
-        Assert.Equal("v1", _cloud.ContentOf(_world + ".bak/_main.1.db2"));
+        var currentFiles = await ExtractRemoteZipAsync(ZipName);
+        Assert.Equal("v3", currentFiles["_main.2.db2"]);
+        var backupFiles = await ExtractRemoteZipAsync(BackupZipName);
+        Assert.Equal("v1", backupFiles["_main.1.db2"]);
     }
 
     [Fact]
@@ -466,7 +469,7 @@ public sealed class SyncEngineTests : IDisposable
     {
         if (GameIsRunning) return;
         WriteLocal(2, db2: "v2");
-        SeedRemoteWorld(new Dictionary<string, string>
+        await SeedRemoteWorldAsync(new Dictionary<string, string>
         {
             ["_main.1.db2"] = "v1",
             ["_main.1.fwl2"] = "fwl1",
@@ -475,7 +478,7 @@ public sealed class SyncEngineTests : IDisposable
         }, DateTimeOffset.UtcNow.AddDays(-1));
 
         await _engine.SyncNowAsync(); // backs up the pre-session v1
-        Assert.Equal("v1", _cloud.ContentOf(_world + ".bak/_main.1.db2"));
+        Assert.Equal("v1", (await ExtractRemoteZipAsync(BackupZipName))["_main.1.db2"]);
 
         // Simulate the app restarting mid-session: a brand-new engine, same persisted
         // session state file. Before persistence this re-backed-up and destroyed the
@@ -488,18 +491,20 @@ public sealed class SyncEngineTests : IDisposable
         await engine2.SyncNowAsync();
         await engine2.DisposeAsync();
 
-        Assert.Equal("v3", _cloud.ContentOf(Prefix + "_main.2.db2"));
-        Assert.Equal("v1", _cloud.ContentOf(_world + ".bak/_main.1.db2")); // snapshot survived the restart
+        Assert.Equal("v3", (await ExtractRemoteZipAsync(ZipName))["_main.2.db2"]);
+        Assert.Equal("v1", (await ExtractRemoteZipAsync(BackupZipName))["_main.1.db2"]); // snapshot survived the restart
     }
 
-    // ---- no-op / repair paths -----------------------------------------------
+    // ---- no-op path ---------------------------------------------------------
 
     [Fact]
-    public async Task NoTransfer_WhenFileSetMatches()
+    public async Task NoTransfer_WhenLocalZipMatchesRemote()
     {
         if (GameIsRunning) return;
+        // Same file names and content locally and remotely must hash identically — the
+        // whole basis for skipping a transfer depends on WorldZip being deterministic.
         WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
-        SeedRemoteWorld(OneRevision());
+        await SeedRemoteWorldAsync(OneRevision());
 
         await _engine.SyncNowAsync();
 
@@ -511,11 +516,11 @@ public sealed class SyncEngineTests : IDisposable
     public async Task Fwl2OnlyChange_TriggersUpload()
     {
         if (GameIsRunning) return;
-        // Direction is decided by comparing the whole file set, so a metadata-only
+        // Direction is decided by comparing the whole archive's hash, so a metadata-only
         // change (fwl2 diverges while db2 matches) is not ignored.
         WriteLocal(1, db2: "same", fwl2: "DIFFERENT-local-fwl2",
             chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
-        SeedRemoteWorld(new Dictionary<string, string>
+        await SeedRemoteWorldAsync(new Dictionary<string, string>
         {
             ["_main.1.db2"] = "same",
             ["_main.1.fwl2"] = "remote-fwl2",
@@ -526,70 +531,8 @@ public sealed class SyncEngineTests : IDisposable
 
         await _engine.SyncNowAsync();
 
-        Assert.Equal("DIFFERENT-local-fwl2", _cloud.ContentOf(Prefix + "_main.1.fwl2"));
-    }
-
-    [Fact]
-    public async Task MissingRemoteFile_IsCompleted_ViaNormalUpload_NotRepairPath()
-    {
-        if (GameIsRunning) return;
-        // A file set with anything missing simply isn't a "match" — it's resolved
-        // through the normal upload path, which fills the gap as a side effect (there's
-        // no separate partial-completion / repair path for a missing file).
-        WriteLocal(1, db2: "same", chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
-        // The db2 made it up but the rest of the upload died, and it predates local.
-        _cloud.Seed(Prefix + "_main.1.db2", "same", DateTimeOffset.UtcNow.AddDays(-1));
-
-        await _engine.SyncNowAsync();
-
-        Assert.Equal("fwl2", _cloud.ContentOf(Prefix + "_main.1.fwl2"));
-        Assert.Equal(ManifestName, _cloud.Calls.Last().Split(':')[1]); // marker uploaded last, as always
-    }
-
-    [Fact]
-    public async Task UnrelatedRemoteFiles_AreInert()
-    {
-        if (GameIsRunning) return;
-        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
-        SeedRemoteWorld(OneRevision());
-        // Another world's files, and this world's lock file — neither should be mistaken
-        // for part of this world's manifest.
-        _cloud.Seed("SomeOtherWorld/_main.1.db2", "unrelated");
-        _cloud.Seed(_world + ".lock", "{}");
-
-        await _engine.SyncNowAsync();
-
-        Assert.Empty(_cloud.Calls); // nothing mistaken for this world's files
-        Assert.Equal(SyncStatus.InSync, _statuses.Last());
-    }
-
-    [Fact]
-    public async Task StaleMarker_IsRepaired_WhenLocalMatches()
-    {
-        if (GameIsRunning) return;
-        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
-        var files = OneRevision();
-        foreach (var (name, content) in files) _cloud.Seed(Prefix + name, content);
-        _cloud.Seed(ManifestName, "garbage-from-a-failed-upload");
-
-        await _engine.SyncNowAsync();
-
-        Assert.Equal(new[] { $"upload:{ManifestName}" }, _cloud.Calls);
-        Assert.Equal(SyncStatus.InSync, _statuses.Last());
-    }
-
-    [Fact]
-    public async Task NoRepair_WhileSomeoneElseHoldsTheLock()
-    {
-        if (GameIsRunning) return;
-        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
-        SeedRemoteWorld(OneRevision(), withMarker: false);
-        _cloud.Locks[_world] = new WorldLock("Bob", DateTimeOffset.UtcNow);
-
-        await _engine.SyncNowAsync();
-
-        Assert.Empty(_cloud.Calls);
-        Assert.Equal(SyncStatus.LockedByOther, _statuses.Last());
+        var remoteFiles = await ExtractRemoteZipAsync(ZipName);
+        Assert.Equal("DIFFERENT-local-fwl2", remoteFiles["_main.1.fwl2"]);
     }
 
     [Fact]
@@ -598,7 +541,7 @@ public sealed class SyncEngineTests : IDisposable
         if (GameIsRunning) return;
         _settings.SelectedWorlds.Clear();
         WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
-        _cloud.Seed(Prefix + "_main.1.db2", "remotedb2");
+        _cloud.Seed(ZipName, "remotedb2");
 
         await _engine.SyncNowAsync();
 
@@ -612,7 +555,7 @@ public sealed class SyncEngineTests : IDisposable
     public async Task Download_MirrorsWholeFolderIntoLocalLow_ForInGameVisibility()
     {
         if (GameIsRunning) return;
-        SeedRemoteWorld(OneRevision());
+        await SeedRemoteWorldAsync(OneRevision());
 
         await _engine.SyncNowAsync();
 

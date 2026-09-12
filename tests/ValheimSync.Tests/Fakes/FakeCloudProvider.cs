@@ -48,6 +48,9 @@ internal sealed class FakeCloudProvider : ICloudStorageProvider
     public void Seed(string name, string content, DateTimeOffset? modified = null) =>
         Files[name] = (Encoding.UTF8.GetBytes(content), modified ?? DateTimeOffset.UtcNow);
 
+    public void SeedBytes(string name, byte[] content, DateTimeOffset? modified = null) =>
+        Files[name] = (content, modified ?? DateTimeOffset.UtcNow);
+
     public string ContentOf(string name) => Encoding.UTF8.GetString(Files[name].Content);
 
     private static string Md5(byte[] bytes) =>
