@@ -50,6 +50,10 @@ public sealed class SyncEngine : IAsyncDisposable
     private readonly string _sessionStatePath;
 
     public event Action<string, SyncStatus>? WorldStatusChanged;
+
+    /// <summary>Fired repeatedly during an upload/download with a 0.0–1.0 fraction, so the
+    /// UI can render an actual fill instead of just an indeterminate "syncing" state.</summary>
+    public event Action<string, double>? WorldProgressChanged;
     public event Action<string>? Log;
 
     public SyncEngine(AppSettings settings, ICloudStorageProvider cloud, ILogger? log = null,
@@ -315,7 +319,8 @@ public sealed class SyncEngine : IAsyncDisposable
     private async Task UploadWorldAsync(string worldName, WorldSave local, string localZipPath,
         CancellationToken ct)
     {
-        WorldStatusChanged?.Invoke(worldName, SyncStatus.Syncing);
+        WorldStatusChanged?.Invoke(worldName, SyncStatus.Uploading);
+        WorldProgressChanged?.Invoke(worldName, 0.0);
 
         // Snapshot once per play session: the first upload of a session rolls the
         // pre-session remote save into a single backup per world. Later uploads in the
@@ -329,7 +334,8 @@ public sealed class SyncEngine : IAsyncDisposable
         }
 
         Info($"[{worldName}] Uploading ({local.SizeBytes / (1024.0 * 1024):F1} MB)...");
-        await _cloud.UploadAsync(localZipPath, WorldArchive.ZipName(worldName), null, ct);
+        var progress = new SyncProgress(p => WorldProgressChanged?.Invoke(worldName, p));
+        await _cloud.UploadAsync(localZipPath, WorldArchive.ZipName(worldName), progress, ct);
 
         Info($"[{worldName}] Upload complete.");
         WorldStatusChanged?.Invoke(worldName, SyncStatus.InSync);
@@ -372,7 +378,8 @@ public sealed class SyncEngine : IAsyncDisposable
 
     private async Task DownloadWorldAsync(string worldName, RemoteFile remoteZip, CancellationToken ct)
     {
-        WorldStatusChanged?.Invoke(worldName, SyncStatus.Syncing);
+        WorldStatusChanged?.Invoke(worldName, SyncStatus.Downloading);
+        WorldProgressChanged?.Invoke(worldName, 0.0);
         Info($"[{worldName}] Downloading...");
 
         Directory.CreateDirectory(_settings.WorldsPath);
@@ -382,7 +389,8 @@ public sealed class SyncEngine : IAsyncDisposable
         var tmpDir = Path.Combine(Path.GetTempPath(), $"{worldName}-{Guid.NewGuid():N}");
         try
         {
-            await _cloud.DownloadAsync(remoteZip.Name, tmpZip, null, ct);
+            var progress = new SyncProgress(p => WorldProgressChanged?.Invoke(worldName, p));
+            await _cloud.DownloadAsync(remoteZip.Name, tmpZip, progress, ct);
 
             // Verify the archive against the listing's hash before touching the live folder.
             if (remoteZip.Md5Checksum is not null &&
@@ -494,5 +502,18 @@ public sealed class SyncEngine : IAsyncDisposable
         _inGameTimer?.Dispose();
         _watcher?.Dispose();
         await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A plain synchronous IProgress&lt;double&gt; — unlike <see cref="Progress{T}"/>, which
+    /// always defers its callback via a captured (or default thread-pool) SynchronizationContext,
+    /// this invokes immediately on whatever thread reports. WorldProgressChanged's subscribers
+    /// (the UI) already marshal to their own thread, so there's nothing to gain from that
+    /// indirection — and deferring it would make progress arrive late/out of order relative to
+    /// the surrounding upload/download call.
+    /// </summary>
+    private sealed class SyncProgress(Action<double> report) : IProgress<double>
+    {
+        public void Report(double value) => report(value);
     }
 }

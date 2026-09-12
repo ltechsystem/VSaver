@@ -315,6 +315,42 @@ public sealed class SyncEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task Upload_ReportsProgress_FromZeroToComplete()
+    {
+        if (GameIsRunning) return;
+        // Drives the world list's fill-in circular badge — must start at 0 and reach 1.0,
+        // not just flip straight from "nothing" to "done".
+        WriteLocal(1, chunks: new Dictionary<string, string> { ["1e_1e__1_1.chunk"] = "chunkA" });
+        var progressValues = new List<double>();
+        _engine.WorldProgressChanged += (world, p) =>
+        {
+            if (world == _world) progressValues.Add(p);
+        };
+
+        await _engine.SyncNowAsync();
+
+        Assert.Equal(0.0, progressValues.First());
+        Assert.Equal(1.0, progressValues.Last());
+    }
+
+    [Fact]
+    public async Task Download_ReportsProgress_FromZeroToComplete()
+    {
+        if (GameIsRunning) return;
+        await SeedRemoteWorldAsync(OneRevision());
+        var progressValues = new List<double>();
+        _engine.WorldProgressChanged += (world, p) =>
+        {
+            if (world == _world) progressValues.Add(p);
+        };
+
+        await _engine.SyncNowAsync();
+
+        Assert.Equal(0.0, progressValues.First());
+        Assert.Equal(1.0, progressValues.Last());
+    }
+
+    [Fact]
     public async Task Upload_WhenIHoldLock_EvenIfRemoteIsNewer()
     {
         if (GameIsRunning) return;

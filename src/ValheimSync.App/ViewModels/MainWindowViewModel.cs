@@ -363,6 +363,12 @@ public partial class MainWindowViewModel : ObservableObject
                     string.Equals(w.Name, world, StringComparison.OrdinalIgnoreCase));
                 if (item is not null) item.Status = status;
             });
+            _engine.WorldProgressChanged += (world, progress) => Dispatcher.UIThread.Post(() =>
+            {
+                var item = Worlds.FirstOrDefault(w =>
+                    string.Equals(w.Name, world, StringComparison.OrdinalIgnoreCase));
+                if (item is not null) item.Progress = progress;
+            });
 
             await _engine.StartAsync();
 

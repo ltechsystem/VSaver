@@ -8,7 +8,8 @@ public enum SyncStatus
     RemoteNewer,    // needs download
     LocalOnly,      // never uploaded
     RemoteOnly,     // exists only in the cloud
-    Syncing,
+    Uploading,
+    Downloading,
     LockedByOther,
     Error
 }
