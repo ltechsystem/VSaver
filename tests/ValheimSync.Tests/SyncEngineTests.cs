@@ -29,6 +29,8 @@ public sealed class SyncEngineTests : IDisposable
     private readonly List<SyncStatus> _statuses = new();
 
     private string WorldDir => Path.Combine(_dir, _world);
+    // Safety copies live under the app folder, not beside the world (see SyncEngine.BackupDirFor).
+    private string BackupDir => Path.Combine(AppContext.BaseDirectory, "backups", "worlds", _world + ".synbak");
     private string SessionStatePath => Path.Combine(_dir, "sessionstate.json");
     private string ZipName => WorldArchive.ZipName(_world);
     private string BackupZipName => WorldArchive.BackupZipName(_world);
@@ -212,7 +214,7 @@ public sealed class SyncEngineTests : IDisposable
 
         Assert.Equal("remotedb2", File.ReadAllText(Path.Combine(WorldDir, "_main.1.db2")));
         // The replaced local save must survive as a whole-folder .synbak safety copy.
-        Assert.Equal("localdb2", File.ReadAllText(Path.Combine(WorldDir + ".synbak", "_main.1.db2")));
+        Assert.Equal("localdb2", File.ReadAllText(Path.Combine(BackupDir, "_main.1.db2")));
     }
 
     [Fact]
@@ -238,7 +240,7 @@ public sealed class SyncEngineTests : IDisposable
         Assert.False(File.Exists(Path.Combine(WorldDir, "_main.1.db2")));
         Assert.False(File.Exists(Path.Combine(WorldDir, "1e_1e__1_1.chunk")));
         // The whole replaced folder survives as a single .synbak safety copy.
-        var backupDb2 = Path.Combine(WorldDir + ".synbak", "_main.1.db2");
+        var backupDb2 = Path.Combine(BackupDir, "_main.1.db2");
         Assert.Equal("db2", File.ReadAllText(backupDb2));
     }
 
@@ -609,6 +611,7 @@ public sealed class SyncEngineTests : IDisposable
     {
         _engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
         try { Directory.Delete(_dir, recursive: true); } catch { }
+        try { if (Directory.Exists(BackupDir)) Directory.Delete(BackupDir, recursive: true); } catch { }
 
         // Downloads best-effort mirror the whole world folder into the machine's real
         // Valheim LocalLow folder; remove this test's uniquely-named world if it landed there.

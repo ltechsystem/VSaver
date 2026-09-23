@@ -235,7 +235,30 @@ public sealed class SyncEngine : IAsyncDisposable
         var localZipPath = Path.Combine(Path.GetTempPath(), $"vs-{Guid.NewGuid():N}.zip");
         try
         {
-            await WorldZip.CreateAsync(local.AllFilePaths, localZipPath, ct);
+            // Valheim versions the save itself and may move to a newer revision (deleting the one
+            // we scanned) at any time. Re-resolve the current revision right before packing, and
+            // rescan if files vanish mid-pack.
+            for (var attempt = 1; ; attempt++)
+            {
+                local = WorldScanner.Scan(_settings.WorldsPath)
+                    .FirstOrDefault(w => string.Equals(w.Name, worldName, StringComparison.OrdinalIgnoreCase));
+                if (local is null)
+                {
+                    WorldStatusChanged?.Invoke(worldName, SyncStatus.Unknown);
+                    return;
+                }
+                try
+                {
+                    await WorldZip.CreateAsync(local.AllFilePaths, localZipPath, ct);
+                    break;
+                }
+                catch (Exception ex) when (attempt < 4 &&
+                    ex is FileNotFoundException or DirectoryNotFoundException)
+                {
+                    _log.LogWarning(ex, "[{World}] Save moved to a newer revision while packing (attempt {Attempt}); rescanning", worldName, attempt);
+                    await Task.Delay(TimeSpan.FromSeconds(2), ct);
+                }
+            }
             var localMd5 = await Hashing.Md5Async(localZipPath, ct);
 
             // ---- Compare: does the local save exactly match what's remote? ----
@@ -376,6 +399,23 @@ public sealed class SyncEngine : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Safety copies of replaced worlds live next to the app, NOT beside the live world: a
+    /// sibling "&lt;World&gt;.synbak" folder inside Valheim's worlds folder is picked up by the
+    /// game as a bogus extra world.
+    /// </summary>
+    private static string BackupDirFor(string area, string worldName) =>
+        Path.Combine(AppContext.BaseDirectory, "backups", area, worldName + ".synbak");
+
+    /// <summary>File-by-file because the app folder may be on another volume.</summary>
+    private static void MoveDirectory(string src, string dest)
+    {
+        Directory.CreateDirectory(dest);
+        foreach (var file in Directory.EnumerateFiles(src))
+            File.Move(file, Path.Combine(dest, Path.GetFileName(file)), overwrite: true);
+        Directory.Delete(src, recursive: true);
+    }
+
     private async Task DownloadWorldAsync(string worldName, RemoteFile remoteZip, CancellationToken ct)
     {
         WorldStatusChanged?.Invoke(worldName, SyncStatus.Downloading);
@@ -407,9 +447,9 @@ public sealed class SyncEngine : IAsyncDisposable
             // the download above has verified — a failed/corrupt download leaves it as-is.
             if (Directory.Exists(worldDir) && Directory.EnumerateFileSystemEntries(worldDir).Any())
             {
-                var backupDir = worldDir + ".synbak";
+                var backupDir = BackupDirFor("worlds", worldName);
                 if (Directory.Exists(backupDir)) Directory.Delete(backupDir, recursive: true);
-                Directory.Move(worldDir, backupDir);
+                MoveDirectory(worldDir, backupDir);
             }
             Directory.CreateDirectory(worldDir);
 
@@ -454,9 +494,9 @@ public sealed class SyncEngine : IAsyncDisposable
 
             if (Directory.Exists(dest))
             {
-                var backupDir = dest + ".synbak";
+                var backupDir = BackupDirFor("locallow", worldName);
                 if (Directory.Exists(backupDir)) Directory.Delete(backupDir, recursive: true);
-                Directory.Move(dest, backupDir);
+                MoveDirectory(dest, backupDir);
             }
 
             Directory.CreateDirectory(dest);
