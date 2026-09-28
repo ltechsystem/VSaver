@@ -55,6 +55,25 @@ public sealed class WorldZipTests : IDisposable
         Assert.Equal("zone data", await File.ReadAllTextAsync(Path.Combine(destDir, "zone.chunk")));
     }
 
+    [Fact]
+    public async Task Extract_SkipsDirectoryEntries()
+    {
+        var zipPath = Path.Combine(_dir, "withdir.zip");
+        using (var fs = new FileStream(zipPath, FileMode.CreateNew))
+        using (var archive = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("sub/");
+            var entry = archive.CreateEntry("world.db2");
+            await using var s = entry.Open();
+            await s.WriteAsync("data"u8.ToArray());
+        }
+
+        var destDir = Path.Combine(_dir, "dest");
+        await WorldZip.ExtractAsync(zipPath, destDir);
+
+        Assert.Equal("data", await File.ReadAllTextAsync(Path.Combine(destDir, "world.db2")));
+    }
+
     public void Dispose()
     {
         try { Directory.Delete(_dir, recursive: true); } catch { }

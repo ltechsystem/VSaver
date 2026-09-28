@@ -45,15 +45,18 @@ public sealed class AppSettings
     public HashSet<string> SelectedWorlds { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Where this machine's Valheim keeps its worlds. Uses the explicit override
-    /// if set, otherwise auto-detects (Steam-Cloud location first, then LocalLow).
-    /// Not persisted — it's resolved fresh per machine.
+    /// Where this machine's Valheim keeps its worlds. Uses the explicit override if set,
+    /// otherwise Valheim's own LocalLow "local storage" folder — the folder the game itself
+    /// reads and writes. Steam's Cloud "remote" cache is deliberately never auto-detected
+    /// here; see <see cref="ValheimSaveLocations"/>. Not persisted — resolved fresh per
+    /// machine.
     /// </summary>
     [JsonIgnore]
     public string WorldsPath =>
         !string.IsNullOrWhiteSpace(WorldsPathOverride)
             ? WorldsPathOverride
-            : ValheimSaveLocations.ResolveWorldsFolder();
+            : ValheimSaveLocations.ResolveLocalLowWorldsFolder()
+                ?? throw new DirectoryNotFoundException(ValheimSaveLocations.LocalLowNotFoundMessage);
 
     private static string SettingsPath =>
         Path.Combine(AppContext.BaseDirectory, "settings.json");

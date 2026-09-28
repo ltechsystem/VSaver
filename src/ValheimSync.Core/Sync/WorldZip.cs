@@ -44,6 +44,10 @@ public static class WorldZip
 
         foreach (var entry in archive.Entries)
         {
+            // Directory entries ("sub/") have an empty Name; combining it would resolve to
+            // destDir itself and File.Create on a directory throws UnauthorizedAccess.
+            if (string.IsNullOrEmpty(entry.Name)) continue;
+
             await using var entryStream = entry.Open();
             await using var destStream = File.Create(Path.Combine(destDir, entry.Name));
             await entryStream.CopyToAsync(destStream, ct);

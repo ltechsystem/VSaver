@@ -10,8 +10,9 @@ namespace ValheimSync.Tests;
 /// Exercises the whole sync decision logic through the ICloudStorageProvider seam.
 ///
 /// Notes:
-///  - Each test uses a unique world name so the engine's best-effort mirror into the real
-///    Valheim LocalLow folder (if this machine has one) can be cleaned up safely in Dispose.
+///  - Every test sets WorldsPathOverride to a private temp directory, so nothing here ever
+///    touches the machine's real Valheim LocalLow folder (or, per AppSettings.WorldsPath,
+///    Steam's Cloud folder — which the app never auto-detects or touches at all).
 ///  - Tests early-return if Valheim is actually running on this machine, because the engine
 ///    deliberately refuses to transfer while the game is up (static ValheimProcess seam).
 ///  - A world's whole save now travels as one deterministic zip (see WorldZip), so a
@@ -181,17 +182,6 @@ public sealed class SyncEngineTests : IDisposable
 
         Assert.True(Directory.Exists(Path.Combine(_dir, secondWorld)));
         try { Directory.Delete(Path.Combine(_dir, secondWorld), recursive: true); } catch { }
-        try
-        {
-            var localLow = ValheimSaveLocations.ResolveLocalLowWorldsFolder();
-            if (localLow is not null)
-                foreach (var suffix in new[] { "", ".synbak" })
-                {
-                    var p = Path.Combine(localLow, secondWorld + suffix);
-                    if (Directory.Exists(p)) Directory.Delete(p, recursive: true);
-                }
-        }
-        catch { }
     }
 
     [Fact]
@@ -587,22 +577,58 @@ public sealed class SyncEngineTests : IDisposable
         Assert.Empty(_statuses);
     }
 
-    // ---- LocalLow mirroring -------------------------------------------------
+    // ---- Revision-number direction --------------------------------------------
+
+    private static IReadOnlyDictionary<string, string> RevisionFiles(int n, string db2) =>
+        new Dictionary<string, string>
+        {
+            [$"_main.{n}.db2"] = db2,
+            [$"_main.{n}.fwl2"] = "fwl2",
+            [$"_main.{n}.chunks"] = "idx",
+            [$"_main.{n}.ok"] = "1",
+        };
 
     [Fact]
-    public async Task Download_MirrorsWholeFolderIntoLocalLow_ForInGameVisibility()
+    public async Task HigherRemoteRevision_Downloads_EvenWhenRemoteIsOlderByTimestamp()
     {
         if (GameIsRunning) return;
-        await SeedRemoteWorldAsync(OneRevision());
+        WriteLocal(3, db2: "local-r3"); // written "now"
+        await SeedRemoteWorldAsync(RevisionFiles(5, "remote-r5"),
+            new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        _cloud.Revisions[ZipName] = 5;
 
         await _engine.SyncNowAsync();
 
-        var localLow = ValheimSaveLocations.ResolveLocalLowWorldsFolder();
-        if (localLow is null) return; // this machine has no LocalLow folder — nothing to check
-        var mirrored = Path.Combine(localLow, _world);
-        Assert.True(Directory.Exists(mirrored));
-        Assert.Equal("db2", File.ReadAllText(Path.Combine(mirrored, "_main.1.db2")));
-        Assert.Equal("chunkA", File.ReadAllText(Path.Combine(mirrored, "1e_1e__1_1.chunk")));
+        Assert.Equal("remote-r5", File.ReadAllText(Path.Combine(WorldDir, "_main.5.db2")));
+    }
+
+    [Fact]
+    public async Task HigherLocalRevision_Uploads_EvenWhenRemoteIsNewerByTimestamp()
+    {
+        if (GameIsRunning) return;
+        WriteLocal(5, db2: "local-r5");
+        AgeLocalFiles();
+        await SeedRemoteWorldAsync(RevisionFiles(3, "remote-r3")); // modified "now"
+        _cloud.Revisions[ZipName] = 3;
+
+        await _engine.SyncNowAsync();
+
+        Assert.Equal(5, _cloud.Revisions[ZipName]);
+        Assert.Equal("local-r5", (await ExtractRemoteZipAsync(ZipName))["_main.5.db2"]);
+    }
+
+    [Fact]
+    public async Task EqualRevisions_FallBackToTimestamp()
+    {
+        if (GameIsRunning) return;
+        WriteLocal(4, db2: "local-r4");
+        AgeLocalFiles();
+        await SeedRemoteWorldAsync(RevisionFiles(4, "remote-r4")); // newer than local
+        _cloud.Revisions[ZipName] = 4;
+
+        await _engine.SyncNowAsync();
+
+        Assert.Equal("remote-r4", File.ReadAllText(Path.Combine(WorldDir, "_main.4.db2")));
     }
 
     // -----------------------------------------------------------------------
@@ -612,19 +638,5 @@ public sealed class SyncEngineTests : IDisposable
         _engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
         try { Directory.Delete(_dir, recursive: true); } catch { }
         try { if (Directory.Exists(BackupDir)) Directory.Delete(BackupDir, recursive: true); } catch { }
-
-        // Downloads best-effort mirror the whole world folder into the machine's real
-        // Valheim LocalLow folder; remove this test's uniquely-named world if it landed there.
-        try
-        {
-            var localLow = ValheimSaveLocations.ResolveLocalLowWorldsFolder();
-            if (localLow is not null)
-                foreach (var suffix in new[] { "", ".synbak" })
-                {
-                    var p = Path.Combine(localLow, _world + suffix);
-                    if (Directory.Exists(p)) Directory.Delete(p, recursive: true);
-                }
-        }
-        catch { }
     }
 }

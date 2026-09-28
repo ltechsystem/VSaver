@@ -20,6 +20,8 @@ namespace ValheimSync.Core.Storage;
 /// </summary>
 public sealed class GoogleDriveStorageProvider : ICloudStorageProvider
 {
+    private const string RevisionProperty = "revision";
+
     private readonly string _folderId;
     private readonly string? _credentialsPathOverride;
     private DriveService? _drive;
@@ -169,7 +171,7 @@ public sealed class GoogleDriveStorageProvider : ICloudStorageProvider
         {
             var request = Drive.Files.List();
             request.Q = $"'{_folderId}' in parents and trashed = false";
-            request.Fields = "nextPageToken, files(id, name, md5Checksum, size, modifiedTime)";
+            request.Fields = "nextPageToken, files(id, name, md5Checksum, size, modifiedTime, appProperties)";
             request.PageSize = 100;
             request.PageToken = pageToken;
             request.SupportsAllDrives = true;
@@ -181,7 +183,10 @@ public sealed class GoogleDriveStorageProvider : ICloudStorageProvider
                 f.Name,
                 f.Md5Checksum,
                 f.Size ?? 0,
-                f.ModifiedTimeDateTimeOffset ?? DateTimeOffset.MinValue)));
+                f.ModifiedTimeDateTimeOffset ?? DateTimeOffset.MinValue,
+                f.AppProperties is not null &&
+                    f.AppProperties.TryGetValue(RevisionProperty, out var rev) &&
+                    int.TryParse(rev, out var n) ? n : null)));
 
             pageToken = page.NextPageToken;
         } while (pageToken is not null);
@@ -190,15 +195,17 @@ public sealed class GoogleDriveStorageProvider : ICloudStorageProvider
     }
 
     public async Task UploadAsync(string localPath, string remoteName,
-        IProgress<double>? progress = null, CancellationToken ct = default)
+        IProgress<double>? progress = null, CancellationToken ct = default, int? revision = null)
     {
         var existing = await FindByNameAsync(remoteName, ct);
         await using var stream = File.OpenRead(localPath);
         long total = stream.Length;
+        var props = revision is null ? null
+            : new Dictionary<string, string> { [RevisionProperty] = revision.Value.ToString() };
 
         if (existing is null)
         {
-            var meta = new DriveFile { Name = remoteName, Parents = new[] { _folderId } };
+            var meta = new DriveFile { Name = remoteName, Parents = new[] { _folderId }, AppProperties = props };
             var create = Drive.Files.Create(meta, stream, "application/octet-stream");
             create.Fields = "id";
             create.SupportsAllDrives = true;
@@ -208,7 +215,7 @@ public sealed class GoogleDriveStorageProvider : ICloudStorageProvider
         }
         else
         {
-            var update = Drive.Files.Update(new DriveFile(), existing.Id, stream, "application/octet-stream");
+            var update = Drive.Files.Update(new DriveFile { AppProperties = props }, existing.Id, stream, "application/octet-stream");
             update.SupportsAllDrives = true;
             update.ProgressChanged += p => Report(progress, p, total);
             var result = await update.UploadAsync(ct);

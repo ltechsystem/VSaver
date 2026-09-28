@@ -16,6 +16,8 @@ internal sealed class FakeCloudProvider : ICloudStorageProvider
 {
     public readonly Dictionary<string, (byte[] Content, DateTimeOffset Modified)> Files =
         new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Revision metadata per remote file name, as Drive's appProperties would hold.</summary>
+    public readonly Dictionary<string, int> Revisions = new(StringComparer.OrdinalIgnoreCase);
     public readonly Dictionary<string, WorldLock> Locks = new(StringComparer.OrdinalIgnoreCase);
     public readonly List<string> Calls = new();
 
@@ -60,17 +62,19 @@ internal sealed class FakeCloudProvider : ICloudStorageProvider
     {
         IReadOnlyList<RemoteFile> list = Files
             .Select(kv => new RemoteFile(kv.Key, kv.Key, Md5(kv.Value.Content),
-                kv.Value.Content.LongLength, kv.Value.Modified))
+                kv.Value.Content.LongLength, kv.Value.Modified,
+                Revisions.TryGetValue(kv.Key, out var rev) ? rev : null))
             .ToList();
         return Task.FromResult(list);
     }
 
     public async Task UploadAsync(string localPath, string remoteName,
-        IProgress<double>? progress = null, CancellationToken ct = default)
+        IProgress<double>? progress = null, CancellationToken ct = default, int? revision = null)
     {
         var bytes = await File.ReadAllBytesAsync(localPath, ct);
         progress?.Report(0.5); // a real provider reports incrementally; fake it with one midpoint tick
         Files[remoteName] = (bytes, DateTimeOffset.UtcNow);
+        if (revision is int r) Revisions[remoteName] = r;
         progress?.Report(1.0);
         Calls.Add($"upload:{remoteName}");
     }

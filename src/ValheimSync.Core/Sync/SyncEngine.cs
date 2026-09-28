@@ -202,11 +202,19 @@ public sealed class SyncEngine : IAsyncDisposable
         return new string(name.Select(c => invalid.Contains(c) || c == '/' ? '_' : c).ToArray());
     }
 
+    /// <summary>
+    /// The machine's current copy of a world — the only copy ever uploaded, or replaced by a
+    /// download. <see cref="AppSettings.WorldsPath"/> is Valheim's own LocalLow folder (or an
+    /// explicit override); Steam's Cloud "remote" cache is never read or written here.
+    /// </summary>
+    private WorldSave? ScanLocal(string worldName) =>
+        WorldScanner.Scan(_settings.WorldsPath)
+            .FirstOrDefault(w => string.Equals(w.Name, worldName, StringComparison.OrdinalIgnoreCase));
+
     private async Task SyncWorldAsync(string worldName, CancellationToken ct,
         bool allowUploadWhileRunning = false)
     {
-        var local = WorldScanner.Scan(_settings.WorldsPath)
-            .FirstOrDefault(w => string.Equals(w.Name, worldName, StringComparison.OrdinalIgnoreCase));
+        var local = ScanLocal(worldName);
 
         var remote = await _cloud.ListFilesAsync(ct);
         var remoteZip = remote.FirstOrDefault(f =>
@@ -240,8 +248,7 @@ public sealed class SyncEngine : IAsyncDisposable
             // rescan if files vanish mid-pack.
             for (var attempt = 1; ; attempt++)
             {
-                local = WorldScanner.Scan(_settings.WorldsPath)
-                    .FirstOrDefault(w => string.Equals(w.Name, worldName, StringComparison.OrdinalIgnoreCase));
+                local = ScanLocal(worldName);
                 if (local is null)
                 {
                     WorldStatusChanged?.Invoke(worldName, SyncStatus.Unknown);
@@ -275,8 +282,12 @@ public sealed class SyncEngine : IAsyncDisposable
             // If I hold the lock (or no one does and my file is newer), upload.
             // If someone else holds the lock, or the remote is newer, download —
             // but never while Valheim is running locally.
+            // "Newer" is the _main.<N> revision on Drive vs the local one; only when they're
+            // equal (a conflict) or Drive has no revision recorded does the UTC time decide.
             bool remoteIsNewer = remoteZip is not null &&
-                remoteZip.ModifiedTime.UtcDateTime > local.LastWriteUtc;
+                (remoteZip.Revision is int remoteRev && remoteRev != local.Revision
+                    ? remoteRev > local.Revision
+                    : remoteZip.ModifiedTime.UtcDateTime > local.LastWriteUtc);
 
             if (iHoldLock || remoteZip is null || (!otherHoldsLock && !remoteIsNewer))
             {
@@ -358,7 +369,7 @@ public sealed class SyncEngine : IAsyncDisposable
 
         Info($"[{worldName}] Uploading ({local.SizeBytes / (1024.0 * 1024):F1} MB)...");
         var progress = new SyncProgress(p => WorldProgressChanged?.Invoke(worldName, p));
-        await _cloud.UploadAsync(localZipPath, WorldArchive.ZipName(worldName), progress, ct);
+        await _cloud.UploadAsync(localZipPath, WorldArchive.ZipName(worldName), progress, ct, local.Revision);
 
         Info($"[{worldName}] Upload complete.");
         WorldStatusChanged?.Invoke(worldName, SyncStatus.InSync);
@@ -404,8 +415,8 @@ public sealed class SyncEngine : IAsyncDisposable
     /// sibling "&lt;World&gt;.synbak" folder inside Valheim's worlds folder is picked up by the
     /// game as a bogus extra world.
     /// </summary>
-    private static string BackupDirFor(string area, string worldName) =>
-        Path.Combine(AppContext.BaseDirectory, "backups", area, worldName + ".synbak");
+    private static string BackupDirFor(string worldName) =>
+        Path.Combine(AppContext.BaseDirectory, "backups", "worlds", worldName + ".synbak");
 
     /// <summary>File-by-file because the app folder may be on another volume.</summary>
     private static void MoveDirectory(string src, string dest)
@@ -422,6 +433,8 @@ public sealed class SyncEngine : IAsyncDisposable
         WorldProgressChanged?.Invoke(worldName, 0.0);
         Info($"[{worldName}] Downloading...");
 
+        // WorldsPath is Valheim's own LocalLow folder (or an explicit override) — Steam's
+        // Cloud "remote" cache is never written to.
         Directory.CreateDirectory(_settings.WorldsPath);
         var worldDir = Path.Combine(_settings.WorldsPath, worldName);
 
@@ -447,7 +460,7 @@ public sealed class SyncEngine : IAsyncDisposable
             // the download above has verified — a failed/corrupt download leaves it as-is.
             if (Directory.Exists(worldDir) && Directory.EnumerateFileSystemEntries(worldDir).Any())
             {
-                var backupDir = BackupDirFor("worlds", worldName);
+                var backupDir = BackupDirFor(worldName);
                 if (Directory.Exists(backupDir)) Directory.Delete(backupDir, recursive: true);
                 MoveDirectory(worldDir, backupDir);
             }
@@ -459,10 +472,6 @@ public sealed class SyncEngine : IAsyncDisposable
             foreach (var file in Directory.EnumerateFiles(tmpDir))
                 File.Move(file, Path.Combine(worldDir, Path.GetFileName(file)), overwrite: true);
 
-            // Also drop it into Valheim's LocalLow folder so it actually shows up in the
-            // in-game world list (see MirrorToLocalLow). Never fatal to the download.
-            MirrorToLocalLow(worldName, worldDir);
-
             Info($"[{worldName}] Download complete.");
             WorldStatusChanged?.Invoke(worldName, SyncStatus.InSync);
         }
@@ -471,62 +480,6 @@ public sealed class SyncEngine : IAsyncDisposable
             if (File.Exists(tmpZip)) File.Delete(tmpZip);
             if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true);
         }
-    }
-
-    /// <summary>
-    /// Copies a freshly downloaded world (every file, flat — a world folder never has
-    /// subfolders of its own) into Valheim's LocalLow "local storage" folder, replacing
-    /// anything already there (with a safety copy kept, same as the main download).
-    /// Valheim only adds a world to the in-game list once it imports it from there and
-    /// registers it with Steam Cloud — a world written solely into the Steam userdata\…\
-    /// remote folder never appears. This automates the manual "copy into LocalLow, then
-    /// open Valheim" step. It is best-effort: any failure is logged, never thrown, so a
-    /// download is still considered complete even if this copy can't happen.
-    /// </summary>
-    private void MirrorToLocalLow(string worldName, string worldDir)
-    {
-        try
-        {
-            var folder = ResolveLocalLowMirrorFolder();
-            if (folder is null) return;
-
-            var dest = Path.Combine(folder, worldName);
-
-            if (Directory.Exists(dest))
-            {
-                var backupDir = BackupDirFor("locallow", worldName);
-                if (Directory.Exists(backupDir)) Directory.Delete(backupDir, recursive: true);
-                MoveDirectory(dest, backupDir);
-            }
-
-            Directory.CreateDirectory(dest);
-            foreach (var file in Directory.EnumerateFiles(worldDir))
-                File.Copy(file, Path.Combine(dest, Path.GetFileName(file)), overwrite: true);
-
-            Info($"[{worldName}] Copied into Valheim's local folder — it will appear in game.");
-        }
-        catch (Exception ex)
-        {
-            Info($"[{worldName}] Couldn't copy into Valheim's local folder: {ex.Message}");
-        }
-    }
-
-    /// <summary>Resolves Valheim's LocalLow worlds folder to mirror a download into, or
-    /// null if it can't be found, or if it's the same folder we already sync out of (the
-    /// files are already there — nothing to mirror).</summary>
-    private string? ResolveLocalLowMirrorFolder()
-    {
-        var folder = ValheimSaveLocations.ResolveLocalLowWorldsFolder();
-        if (folder is null) return null;
-
-        if (string.Equals(
-                Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar),
-                Path.GetFullPath(_settings.WorldsPath).TrimEnd(Path.DirectorySeparatorChar),
-                StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        Directory.CreateDirectory(folder);
-        return folder;
     }
 
     private void Info(string message)

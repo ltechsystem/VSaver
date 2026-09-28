@@ -30,16 +30,8 @@ public sealed class ValheimProcessTests
 
 public sealed class ValheimSaveLocationsTests
 {
-    // These probe the real machine, so only invariants that hold everywhere are asserted:
-    // enumeration never throws, and every candidate ends in a Valheim worlds folder name.
-
-    [Fact]
-    public void Candidates_EnumerateWithoutThrowing()
-    {
-        var all = ValheimSaveLocations.Candidates().ToList();
-        Assert.All(all, p =>
-            Assert.True(p.EndsWith("worlds") || p.EndsWith("worlds_local"), p));
-    }
+    // Probes the real machine, so only an invariant that holds everywhere is asserted:
+    // resolution never throws.
 
     [Fact]
     public void ResolveLocalLow_NeverThrows()

@@ -6,4 +6,5 @@ public sealed record RemoteFile(
     string Name,
     string? Md5Checksum,
     long SizeBytes,
-    DateTimeOffset ModifiedTime);
+    DateTimeOffset ModifiedTime,
+    int? Revision = null);
